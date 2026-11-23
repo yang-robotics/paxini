@@ -120,18 +120,22 @@ xdg-open "$RUN/viewer.html"
 - 头显、左右手柄当前位置；
 - 当前 sequence、追踪状态、位姿、手柄输入和关节数量。
 
-Quest 使用独立 SDK 时间轴。页面顶部和 Quest 面板都会显示：
+Quest 默认画在与手套相同的相对 Unix 秒轴上，页面顶部和 Quest 面板会显示：
 
 ```text
-未做跨源时间对齐
+已按 Unix 墙钟对齐（未经 C8 验证）
 ```
 
-手套、相机和 Quest 共用播放/暂停、倍速和全局进度，但 Quest 使用自身归一化进度；
-这**不代表** Quest 样本与手套/相机发生在同一物理时刻。
+用 `--quest-align none` 才回到独立 SDK 时间轴，那时显示「未做跨源时间对齐」。
 
-默认未对齐模式使用 `0%~100%` 归一化横轴，让 Quest 曲线宽度和游标与手套图对齐，
-但标签明确表示不是物理时间。C8 通过并使用 `sdk_unix` 后，才改为与手套相同的
-相对 Unix 秒轴。
+手套、相机和 Quest 共用播放/暂停、倍速和全局进度。**Quest 默认画在与手套相同的
+相对 Unix 秒轴上**（`--quest-align unix`），因为 SDK 戳已约定为主机墙钟；这条口径
+未经 C8 实证，所以界面标「已按 Unix 墙钟对齐（未经 C8 验证）」，只有 `sdk_unix`
+才显示「已按 C8 验证的时钟对齐」。
+
+`--quest-align none` 才用 `0%~100%` 归一化横轴，标签明确表示不是物理时间。
+
+回放读的是原始 `data.h5`，不是 `aligned_<cam>.h5`；这里的对齐只是换横轴，不重采样。
 
 `pose_6d` 中的 xyz 是米制位置，xyzw 是姿态四元数；它不是完整手部骨架，也没有
 手套/相机空间外参。
@@ -145,7 +149,7 @@ Quest 横轴自动降级为轮询 `sequence`，页面会明确提示。
 python3.10 viewer/visualize.py "$RUN" --html --no-quest
 ```
 
-#### 仅 C8 验证后启用时间对齐
+#### 可选：跑 C8 给时钟域留实证
 
 先运行时钟探针，不修改采集 `data.h5`：
 
@@ -170,8 +174,8 @@ python3.10 viewer/visualize.py "$RUN" \
   --quest-clock-report clock_probe/run_YYYYMMDD_HHMMSS/report.json
 ```
 
-对齐后 Quest 使用手套首帧 Unix 时间轴。默认仍是 `--quest-align none`；报告未通过时
-查看器会拒绝 `sdk_unix`，不会静默猜测。
+对齐后 Quest 使用手套首帧 Unix 时间轴。**默认已是 `--quest-align unix`（不需要报告）**；
+`sdk_unix` 才要求报告，未通过时查看器会拒绝，不会静默猜测。
 
 ## 首次联调
 

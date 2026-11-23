@@ -343,4 +343,7 @@ cameras/right_cam0      row 0
 
 对齐逻辑本身没有删除，只是搬到下游处理工程（现有 `Paxini-Align/`）。那边需要的
 输入这里都有：`cap` 的两个 SDK 时间戳、`quest` 的四个 SDK 时间戳、`cameras` 的墙钟。
-Quest 路径还必须先通过 C8 报告与文件级时间戳质量门控。
+
+下游**默认就对 Quest 做对齐**（`--quest-align unix`，把 SDK 戳当主机墙钟用，不要求
+C8 报告）；只有 `--quest-align sdk_unix` 这条路才需要 C8 报告与文件级时间戳质量双重
+门控。没有 Quest 数据时自动跳过。

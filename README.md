@@ -13,7 +13,7 @@ PXCap III 数据手套与 PXDex III 灵巧手的开发工作区。两条线，�
 | 路径 | 内容 |
 |---|---|
 | `Paxini-Cap/` | Cap 采集上位机 → [工程说明](Paxini-Cap/README.md) |
-| `Paxini-Cap/Paxini-Align/` | 下游重采样：手套流插值、通过 C8 后可选 Quest 因果配对 → `aligned_*.h5` → [说明](Paxini-Cap/Paxini-Align/README.md) |
+| `Paxini-Cap/Paxini-Align/` | 下游重采样：手套流插值、Quest 默认按墙钟取前驱 → `aligned_*.h5` → [说明](Paxini-Cap/Paxini-Align/README.md) |
 | `Paxini-Dex/` | Dex 执行器（SDK 封装、`Dex_Quest`、`Dex_Admittance`）→ [说明](Paxini-Dex/README.md) |
 | `agent/` | 给 AI 助手的项目认知文档 → [入口](agent/README.md) |
 | `厂商资料/` | 厂商 PDF 说明书、SDK 手册、PXCap / PXDex 的 URDF 与 STL |
