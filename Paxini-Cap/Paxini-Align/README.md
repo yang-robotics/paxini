@@ -10,7 +10,7 @@ data.h5（cap N 帧 @120Hz + cameras M 帧 @30Hz + quest Q 行）
         │
         ├─ 相机时间戳 − 延迟Δ  →  采样网格（K 个时刻）
         ├─ cap 按网格线性插值
-        └─ Quest 在夹住目标的两条之间插值（可选，--quest-align）
+        └─ Quest 取目标之前最近的一条，整行复制（默认开启）
                                       ↓
                          aligned_<cam>.h5（K 行，一行一个训练样本）
 ```
@@ -40,7 +40,7 @@ Quest 的有效区间也可能比相机窄。所以主轴按**四路窗口的交
 |---|---|
 | 参考相机与其它每路相机 | `[首帧 − Δ, 末帧 − Δ]`（**相机戳是到达时刻，边界必须减同一个 Δ**） |
 | 手套 | `[cap/timestamp_unix_ns[0], [−1]]` |
-| Quest（`--quest-align` 非 none 时） | 有效行（时间戳 > 0）映射到主机 Unix 后的首末 |
+| Quest（默认启用） | 有效行（时间戳 > 0）映射到主机 Unix 后的首末；没有 Quest 数据时不参与 |
 
 窗口外的整行丢弃，`--keep-outside` 只影响是否真的裁掉，计数照算。`summary` 里按来源分开记账：
 
@@ -64,7 +64,7 @@ Quest 的有效区间也可能比相机窄。所以主轴按**四路窗口的交
 | 手套时间戳 | 当作**真实时间戳**，是插值的自变量，不信任何第三方时钟 |
 | 时间对齐方式 | 相机时刻落在两帧手套之间时**线性插值**；落在覆盖范围外则丢弃 |
 | 延迟补偿 | 相机戳是"帧到达主机"的时刻，减去实测 Δ（默认读台账，两路共用同一值）；**台账读不到时 Δ=0 并告警，不再套用历史默认值** |
-| Quest | 默认不处理。`--quest-align unix` 直接当主机墙钟用（免报告）；`sdk_unix` 另需 C8 报告 |
+| Quest | **默认处理**：直接当主机墙钟用（免报告）；`--quest-align none` 关掉；`sdk_unix` 另需 C8 报告 |
 | 时钟域 | 自动判定，**没有 CLI 开关**：只有参考相机、其他相机、手套都带 `timestamp_monotonic_ns` 时才用单调钟。当前 V4L2 路径的相机只有墙钟列（`write_camera_timestamps` 的 `monotonic_ns` 恒为 `None`），所以**实际总是墙钟**，靠 `clock_jumps` 查跳变兜底 |
 
 Quest 的 Unix 目标时刻始终来自参考相机的 `timestamp_unix_ns − Δ`。即使主时间基落在单调钟上，
@@ -91,18 +91,23 @@ python3 align_capture.py <目录> --dry-run
 
 产物：`<采集目录>/aligned/aligned_<参考相机>.h5`。
 
-### 带 Quest 对齐
+### Quest 对齐（默认开启）
 
-SDK 时间戳已确认就是主机墙钟，**不需要任何前置验证**：
+SDK 时间戳已确认就是主机墙钟，所以**默认就对 Quest 做对齐，不需要任何前置验证、
+不需要额外参数**：
 
 ```bash
-python3 align_capture.py <采集目录> --quest-align unix
+python3 align_capture.py <采集目录>              # 默认 --quest-align unix
+python3 align_capture.py <采集目录> --quest-align none   # 不想带 Quest
 ```
 
-`unix` 是宽松路径：把 `sdk_timestamp_ns` 直接当主机 Unix 用，与相机目标时刻比较、
-在相邻两条之间插值。时间戳重复率高或覆盖率低时只警告，不作废产物——手套和相机是
-主体，Quest 是可选增强。summary 里 `quest.clock_domain_verified=false` 记录这条路
-没做过时钟域验证。
+`unix` 是宽松路径：把 `sdk_timestamp_ns` 直接当主机 Unix 与相机目标时刻比较。
+时间戳重复率高或覆盖率低只警告，不作废产物——手套和相机是主体，Quest 是增强。
+summary 里 `quest.clock_domain_verified=false` 记明这条路没做时钟域验证。
+
+**文件里没有 Quest 数据时自动跳过**（`--no-quest` 采的、或采集中 PC Service 全程掉线），
+日志打一行「已请求对齐但没有数据，本次跳过」，仍然 `exit 0`。所以默认值改成对齐之后，
+批量跑老采集不会因为缺 Quest 而失败。
 
 若以后要让时钟域有证据，跑 C8 探针并把报告传给更严格的 `sdk_unix`：
 
@@ -119,29 +124,29 @@ python3.10 align_capture.py <采集目录> \
 跳变直接失败；条件不满足时不写输出文件。报告是同一台主机、同一时钟状态下的**会话级
 证据**，输出记录它的 SHA-256 与换算模型。
 
-### Quest 的插值策略
+### Quest 的行选择：整行取前驱
 
-每个相机帧时刻都去 Quest 序列里找**夹住它的两条**（左邻 ≤ 目标 < 右邻），按字段分别处理：
+对每个相机目标时刻，在映射到主机 Unix 的 Quest 序列里取**严格不晚于它的最后一条**，
+整行复制，**不做任何插值**。
 
-| 字段 | 处理 | 为什么 |
+| 项目 | 做法 | 为什么 |
 |---|---|---|
-| `pose_6d`、`head/pose_xyzw`、`controller_*/pose_xyzw`、`hand_*/joints_pose_xyzw` | 前 3 位（xyz）线性，后 4 位（四元数）**nlerp** | 四元数线性插值会脱离单位球；nlerp 归一化并走短弧（q 与 -q 同一旋转） |
-| `controller_*/grip`、`trigger`、`axis` | 线性 | 都是连续量 |
-| `tracked`、`available`、`buttons/*` | **取左邻** | 布尔状态不能插出“半个 true” |
-| `sequence`、`joint_count`、四个时间戳列 | **取左邻** | 序号/计数/时间戳不是信号 |
+| 位姿、关节、grip/trigger/axis | 整行复制 | 姿态是离散测量值。插值需要四元数处理（nlerp/slerp），换来的只是半个采样周期，比它掩盖的抖动还不值 |
+| `tracked`、`buttons`、`sequence`、四个时间戳 | 整行复制 | 布尔和计数本来就不能插 |
+| 重复时间戳 | 取源文件里**最后一条** | `searchsorted(side="right")-1` 天然如此 |
+| 滞后 | 逐行记 `quest/age_ms` | 前驱的代价是 0~一个采样间隔的滞后，如实记录，下游按需过滤 |
 
-与图像的区别要记住：**相机取前驱（不用未来帧），Quest 插值必然用到右邻。** 这是数值
-重采样的固有要求，不是因果性退步——任何一行都不会造出括号外的值，`quest/span_ms`
-就是括号宽度。跨度大的行插值在硬猜，下游应按它过滤。
+这和图像的处理保持一致：**相机和 Quest 都只取目标时刻之前的样本，永不使用未来帧。**
 
-`--quest-max-age-ms` 默认 `25`：左邻距目标超过这个值就判该行无效。没有有效配对时相机
-行仍然保留，`quest/valid=false`，整组数据按统一缺失语义写 NaN / False / -1。
+`--quest-max-age-ms` 默认 `25`：左邻距目标超过这个值就判该行无效（Quest 中间断档时，
+断口之后头几行会落进这个判据）。没有有效配对时相机行仍然保留，`quest/valid=false`，
+整组数据按统一缺失语义写 NaN / False / -1。
 
-`--quest-min-valid-fraction` 默认 `0.95`：只对 `sdk_unix` 生效（覆盖率不达标即不写文件）；
+`--quest-min-valid-fraction` 默认 `0.95`，**只对 `sdk_unix` 生效**（覆盖率不达标即不写文件）；
 `unix` 模式下覆盖率低只警告，因为这份产物还有手套和相机。
 
 当前 `data_20261118_1` / `_2` 的有效 SDK 时间戳只有 90.44% / 86.38%，最长连续重复
-5472 / 3128 次——`unix` 模式下仍会产出，但 `quest/valid` 会缺一大片，用前先看
+5472 / 3128 次——`unix` 模式下仍会产出，但 `quest/valid` 会缺一片，用前先看
 `summary.quest.valid_fraction`。另外 C8 只确认时钟域，**没有测“设备采样 → SDK 打戳”
 的链路延迟**，所以不能把 SDK 时间称作曝光真值。
 
@@ -176,15 +181,12 @@ python3.10 align_capture.py <采集目录> \
 | `cameras/<id>/frame_index` | (K,) | int32 | **该路**在主轴时刻之前最近的一帧；多视角训练靠它取另一张图 |
 | `cameras/<id>/dt_ms` | (K,) | float32 | 该帧时刻 − 主轴时刻，**恒 ≤ 0**（因果取帧，不会用未来的画面）；唯一例外是主轴早于该路首帧的边界行 |
 | `cameras/<id>/timestamp_ns` | (K,) | int64 | 该帧的真实时刻 |
-| `quest/index` | (K,) | int64 | 插值**左邻**在源文件里的行号；无配对时为 `-1` |
-| `quest/right_index` | (K,) | int64 | 右邻行号；目标晚于最后一条时等于左邻 |
-| `quest/weight` | (K,) | float64 | 落在左右邻之间的比例，0 = 正好在左邻上 |
-| `quest/span_ms` | (K,) | float64 | 左右邻间距，**这一行插值可信度的唯一指标** |
+| `quest/index` | (K,) | int64 | 所选源行号；无配对时为 `-1` |
 | `quest/valid` | (K,) | bool | 是否存在年龄 ≤ `--quest-max-age-ms` 的左邻样本 |
-| `quest/age_ms` | (K,) | float64 | 目标时刻减**左邻**的主机 Unix 时刻；无候选时为 NaN |
+| `quest/age_ms` | (K,) | float64 | 目标时刻减所选样本的主机 Unix 时刻，即这一行的滞后；无候选时为 NaN。**下游过滤“太旧”的行就看它** |
 | `quest/timestamp_sdk_ns` | (K,) | int64 | 所选样本的原始 SDK 时间戳；无配对时为 `-1` |
 | `quest/timestamp_host_unix_ns` | (K,) | int64 | C8 模型换算后的主机 Unix 时刻；无配对时为 `-1` |
-| `quest/data/...` | (K,...) | 原类型 | 完整 `quest/` 数据组**插值后**重建，保留嵌套组名与属性 |
+| `quest/data/...` | (K,...) | 原类型 | 完整 `quest/` 数据组按所选行复制，保留嵌套组和属性 |
 
 `attrs["summary"]` 是一份 JSON 摘要（行数、`kept_rows`、按来源的丢弃计数、公共有效窗口、
 跨度分位、延迟值与 `camera_delay_source`、时钟跳变数、`clock_offset_ms{spread_ms,
@@ -219,10 +221,10 @@ cam1 用的是「主轴时刻之前最近的那一帧」，所以 `cameras/right
 | `--keep-outside` | 关 | 保留手套覆盖范围外的相机帧（默认丢弃） |
 | `--dry-run` | 关 | 只统计，不写文件 |
 | `--clear-write-flag` | 关 | `data.h5` 打不开时清写标志，见下 |
-| `--quest-align` | `none` | `none` / `unix`（直接当主机墙钟，免报告）/ `sdk_unix`（需 C8 报告） |
+| `--quest-align` | `unix` | `unix`（直接当主机墙钟，免报告）/ `sdk_unix`（需 C8 报告）/ `none`（不处理）；没有 Quest 数据时自动跳过 |
 | `--quest-clock-report` | — | `quest_clock_probe.py` 生成的通过报告 |
-| `--quest-max-age-ms` | `25` | 左邻样本距目标时刻允许的最大年龄 |
-| `--quest-min-valid-fraction` | `0.95` | 最小有效配对比例，未达标即不写文件 |
+| `--quest-max-age-ms` | `25` | 所选样本距目标时刻允许的最大滞后 |
+| `--quest-min-valid-fraction` | `0.95` | 最小有效配对比例，仅 `sdk_unix` 生效 |
 
 ## 判据
 
@@ -244,8 +246,10 @@ cam1 用的是「主轴时刻之前最近的那一帧」，所以 `cameras/right
 25 ms，来源是那批 20~35 ms 的单帧空洞，属预期、可通过。训练脚本仍应按
 `glove/span_ms` 自己过滤（例如 `span_ms < 25`），别整份照单全收。
 
-Quest 的 C8 报告、源时间戳覆盖率、倒退和冻结重复是**更早一层**的硬门控，在
-`align_recording` 内部就抛错，连统计都做不出来。两层的共同点是：**不合格就没有产物**。
+`sdk_unix` 模式下，Quest 的 C8 报告、源时间戳覆盖率、倒退和冻结重复是**更早一层**的
+硬门控，在 `align_recording` 内部就抛错，连统计都做不出来。两层的共同点是：
+**不合格就没有产物**。`unix` 模式只有「倒退」会抛错（时间轴非单调就没法取前驱），
+重复和覆盖率问题降级为警告。
 
 ## 坑
 
@@ -292,7 +296,7 @@ python3 selftest.py     # 30 项，不需要硬件，用合成数据精确校验
 
 覆盖：线性信号零误差还原、Δ 逐行精确相减、边界丢弃计数、`--keep-outside`、
 整数走最近邻、counts 合计 444、`--omit-distribution`、时间基自动判定、
-Quest unix 模式免报告插值、四元数 nlerp 走短弧、布尔/整数取左邻、
+Quest 默认对齐、整行取前驱、滞后范围、无数据自动跳过、
 cam1 因果取帧（dt_ms 始终 ≤ 0）、输出可重开、质量判据不合格时不写文件、乱序时间戳必须报错，
 以及 Quest 选样 tie-break、缺失语义、完整字段复制、C8 时钟模型反算、
 文件质量硬门控、有效配对判据和缺报告拒绝。

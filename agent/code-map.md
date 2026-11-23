@@ -55,7 +55,7 @@
 | 改延迟补偿 | 同上 | `resolve_delay()`(:316) | `--no-delay` 与默认值对照，差值应等于 Δ；**默认 0 = 未标定** |
 | 改输出字段 | 同上 | `write_aligned()`(:951) | `selftest` 的"输出可重开"项 + 同步 `Paxini-Align/README.md` 字段表 |
 | 改质量判据 | 同上 | `gates()`(:1120)、`report()`(:1056) | 跑一次真采集；判据不过时不会产出文件，退出码 1 |
-| 改 Quest 对齐 | `Paxini-Align/align_capture.py` | `load_quest_clock_report()`(:88)、`align_quest_to_targets()`(:503)、`_nlerp_quat()`/`_interp_pose_rows()`(:470/:490)、`write_quest_alignment()`(:1041) | `selftest.py` 的 unix 免报告插值、nlerp 短弧、布尔取左邻、选样 tie-break、C8 硬门控；同步 Align README |
+| 改 Quest 对齐 | `Paxini-Align/align_capture.py` | `load_quest_clock_report()`(:88)、`align_quest_to_targets()`(:470)、`write_quest_alignment()`(:1007) | `selftest.py` 的默认对齐、整行取前驱、滞后范围、无数据跳过、选样 tie-break、C8 硬门控；同步 Align README |
 
 对齐层**只读** `data.h5`，绝不回写；改这里不会影响采集端，但改了输出布局要升
 `ALIGNED_FORMAT_VERSION`（当前 2，与采集端的 4 无关）。

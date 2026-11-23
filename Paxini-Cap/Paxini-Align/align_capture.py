@@ -467,39 +467,6 @@ def open_recording(recording: Path, clear_flag: bool = False) -> Any:
             raise AlignError(f"清标志后仍打不开：{detail}") from exc2
 
 
-def _nlerp_quat(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> np.ndarray:
-    """Normalised linear interpolation of unit quaternions along the short arc.
-
-    ``a``/``b`` are (..., 4). Linear interpolation leaves the unit sphere, so the
-    result is renormalised. The dot check flips ``b`` when the two samples sit on
-    opposite hemispheres (q and -q encode the same rotation), which would
-    otherwise make the interpolation take the long way round.
-    """
-    dot = (a * b).sum(axis=-1, keepdims=True)
-    flipped = np.where(dot < 0.0, -b, b)
-    mixed = a * (1.0 - w) + flipped * w
-    norm = np.linalg.norm(mixed, axis=-1, keepdims=True)
-    safe = np.where(norm > 1e-12, norm, 1.0)
-    out = mixed / safe
-    degenerate = norm <= 1e-12
-    if np.any(degenerate):
-        out = np.where(degenerate, a, out)
-    return out
-
-
-def _interp_pose_rows(
-    left: np.ndarray,
-    right: np.ndarray,
-    w: np.ndarray,
-) -> np.ndarray:
-    """Interpolate (..., 7) poses: xyz linearly, quaternion by nlerp."""
-    weight = w.reshape((-1,) + (1,) * (left.ndim - 1))
-    out = np.empty_like(left)
-    out[..., :3] = left[..., :3] * (1.0 - weight) + right[..., :3] * weight
-    out[..., 3:7] = _nlerp_quat(left[..., 3:7], right[..., 3:7], weight)
-    return out
-
-
 def align_quest_to_targets(
     handle: Any,
     target_unix_ns: np.ndarray,
@@ -508,18 +475,18 @@ def align_quest_to_targets(
     report_sha256: str | None,
     max_age_ms: float,
 ) -> dict[str, Any]:
-    """Resample Quest onto the camera grid by interpolating between samples.
+    """Pair each camera instant with the last valid Quest sample at or before it.
+
+    Rows are copied whole, never interpolated. A pose is a discrete measurement,
+    and blending two of them would need quaternion handling whose only gain is
+    half a sample period -- less than the jitter it would paper over. The cost
+    of taking the previous row is a bounded lag, reported per row as ``age_ms``
+    so downstream can filter on it exactly like ``glove/span_ms``.
 
     Two clock paths:
 
     * ``unix`` -- ``sdk_timestamp_ns`` is already host wall clock, use as-is.
     * ``sdk_unix`` -- apply the affine model from a passing C8 report first.
-
-    Interpolation needs the sample *after* the target as its right endpoint, so
-    unlike the images (which only take the previous frame) Quest does reach
-    across the target instant. That is inherent to resampling numbers, not a
-    causality regression: no row invents a value outside its bracket, and
-    ``span_ms`` exposes how wide that bracket was.
     """
     if "quest" not in handle or "quest/sdk_timestamp_ns" not in handle:
         raise AlignError("请求 Quest 对齐，但 data.h5 里没有 quest/sdk_timestamp_ns")
@@ -535,8 +502,8 @@ def align_quest_to_targets(
 
     failures: list[str] = []
     warnings: list[str] = []
-    if quality["unique_count"] < 2:
-        failures.append("有效 SDK 时间戳不足 2 个不同值，无法插值")
+    if quality["unique_count"] < 1:
+        failures.append("没有任何有效 SDK 时间戳")
     if quality["backwards_steps"] > max_backwards:
         failures.append(f"时间戳倒退 {quality['backwards_steps']} 次，时间轴非单调")
     repeated = (
@@ -545,7 +512,7 @@ def align_quest_to_targets(
     )
     if quality["max_same_timestamp_run"] > max_run:
         # 拉取模型下重复是常态。sdk_unix 有 C8 报告背书，超限即判失败；
-        # unix 模式只提示——重复不破坏「插值两端同域」这个前提。
+        # unix 模式只提示——重复不破坏「同一条时间轴」这个前提。
         (failures if mode == QUEST_ALIGNMENT_SDK_UNIX else warnings).append(repeated)
     low_fraction = (
         f"有效时间戳比例 {quality['valid_fraction']:.3f} 低于 {min_valid_fraction:.3f}"
@@ -567,8 +534,8 @@ def align_quest_to_targets(
         model = candidate
 
     valid_indices = np.flatnonzero(raw > 0).astype(np.int64)
-    if valid_indices.size < 2:
-        raise AlignError("Quest 有效样本不足 2 条，无法插值")
+    if valid_indices.size < 1:
+        raise AlignError("Quest 没有任何有效样本")
     valid_raw = raw[valid_indices]
     mapped = (
         sdk_unix_to_host_unix_ns(valid_raw, model)
@@ -579,43 +546,39 @@ def align_quest_to_targets(
         raise AlignError("换算后的 Quest 主机时间戳出现倒退")
 
     targets = np.asarray(target_unix_ns, dtype=np.int64)
-    # 左邻 = 不晚于目标的最后一条；右邻 = 其后一条（线性插值需要它）。
-    pos = np.searchsorted(mapped, targets, side="right") - 1
-    has_left = pos >= 0
-    left_pos = np.clip(pos, 0, mapped.size - 1)
-    right_pos = np.clip(pos + 1, 0, mapped.size - 1)
+    # 严格不晚于目标的最后一条。相同时间戳重复时 side="right" 天然取到最后一条。
+    positions = np.searchsorted(mapped, targets, side="right") - 1
+    has_candidate = positions >= 0
+    selected = np.full(targets.shape, -1, dtype=np.int64)
+    selected_host = np.full(targets.shape, -1, dtype=np.int64)
+    if np.any(has_candidate):
+        picked = positions[has_candidate]
+        selected[has_candidate] = valid_indices[picked]
+        selected_host[has_candidate] = mapped[picked]
+    age_ms = np.full(targets.shape, np.nan, dtype=np.float64)
+    if np.any(has_candidate):
+        age_ms[has_candidate] = (
+            targets[has_candidate] - selected_host[has_candidate]
+        ) / 1e6
+    valid = has_candidate & (age_ms >= 0.0) & (age_ms <= float(max_age_ms))
+    selected[~valid] = -1
+    selected_host[~valid] = -1
+    selected_sdk = np.full(targets.shape, -1, dtype=np.int64)
+    if np.any(valid):
+        selected_sdk[valid] = valid_raw[positions[valid]]
 
-    left_host = mapped[left_pos]
-    right_host = mapped[right_pos]
-    age_ms = (targets - left_host) / 1e6
-    span_ns = right_host - left_host
-    with np.errstate(divide="ignore", invalid="ignore"):
-        weight = np.where(
-            span_ns > 0,
-            (targets - left_host) / np.where(span_ns > 0, span_ns, 1),
-            0.0,
-        )
-    weight = np.clip(weight, 0.0, 1.0)
-    weight = np.where(np.isfinite(weight), weight, 0.0)
-
-    valid = has_left & (age_ms >= 0.0) & (age_ms <= float(max_age_ms))
     valid_age = age_ms[valid]
-    valid_span = span_ns[valid].astype(np.float64) / 1e6
     return {
         "enabled": True,
         "mode": mode,
         "target_clock": "host_unix_ns",
         "source_rows": int(raw.size),
         "max_age_ms": float(max_age_ms),
-        "index": np.where(valid, valid_indices[left_pos], -1).astype(np.int64),
-        "right_index": np.where(valid, valid_indices[right_pos], -1).astype(np.int64),
-        "weight": weight,
+        "index": selected,
         "valid": valid,
-        "age_ms": np.where(valid, age_ms, np.nan),
-        "span_ms": np.where(valid, span_ns / 1e6, np.nan),
-        "timestamp_sdk_ns": np.where(valid, valid_raw[left_pos], -1).astype(np.int64),
-        "timestamp_host_unix_ns": np.where(valid, left_host, -1).astype(np.int64),
-        "right_host_unix_ns": np.where(valid, right_host, -1).astype(np.int64),
+        "age_ms": age_ms,
+        "timestamp_sdk_ns": selected_sdk,
+        "timestamp_host_unix_ns": selected_host,
         "quality": quality,
         "quality_warnings": warnings,
         "clock_report_sha256": report_sha256,
@@ -630,13 +593,7 @@ def align_quest_to_targets(
             "p99": float(np.percentile(valid_age, 99)) if valid_age.size else None,
             "max": float(np.max(valid_age)) if valid_age.size else None,
         },
-        "span_stats_ms": {
-            "median": float(np.median(valid_span)) if valid_span.size else None,
-            "p95": float(np.percentile(valid_span, 95)) if valid_span.size else None,
-            "max": float(np.max(valid_span)) if valid_span.size else None,
-        },
     }
-
 
 
 def quest_valid_window(
@@ -773,6 +730,24 @@ def align_recording(
         # 同一个 Δ，否则窗口整体晚 Δ，要么丢掉最早的几十帧，要么留下没有图像的帧。
         # 计数是增量式的（手套 → 各相机 → Quest），所以各项相加正好等于总丢弃数；
         # 一行只算给第一个排除它的来源。
+        # 默认就对 Quest 做对齐，所以「配了但这份文件没有 Quest」必须自动跳过，
+        # 否则 --no-quest 采的每一份都会在批量里报错。
+        quest_rows_available = (
+            int(handle["quest/sdk_timestamp_ns"].shape[0])
+            if "quest/sdk_timestamp_ns" in handle
+            else 0
+        )
+        quest_active = (
+            quest_alignment in QUEST_ALIGNMENT_ACTIVE and quest_rows_available > 0
+        )
+        quest_skipped_reason: str | None = None
+        if quest_alignment in QUEST_ALIGNMENT_ACTIVE and not quest_active:
+            quest_skipped_reason = (
+                "data.h5 里没有 quest/sdk_timestamp_ns 数据集"
+                if "quest/sdk_timestamp_ns" not in handle
+                else "quest/sdk_timestamp_ns 是 0 行（采集时没拿到样本）"
+            )
+
         windows: dict[str, dict[str, int]] = {}
         keep = np.ones(master_t.size, dtype=bool)
 
@@ -797,7 +772,7 @@ def align_recording(
             keep &= camera_ok
 
         dropped_by_quest = 0
-        if quest_alignment in QUEST_ALIGNMENT_ACTIVE:
+        if quest_active:
             quest_window = quest_valid_window(
                 handle, quest_clock_report, quest_alignment
             )
@@ -859,7 +834,7 @@ def align_recording(
                 distribution_note = "nearest (--nearest-distribution)"
 
         quest_result = None
-        if quest_alignment in QUEST_ALIGNMENT_ACTIVE:
+        if quest_active:
             quest_result = align_quest_to_targets(
                 handle,
                 master_unix_t,
@@ -935,6 +910,7 @@ def align_recording(
         "distribution": distribution_note,
         "quest": quest_result,
         "quest_alignment": quest_alignment,
+        "quest_skipped_reason": quest_skipped_reason,
         "quest_min_valid_fraction": float(quest_min_valid_fraction),
         "meta": meta_attrs,
     }
@@ -963,72 +939,66 @@ def _missing_value(dtype: np.dtype[Any], name: str) -> Any:
     raise AlignError(f"Quest 组含不支持补齐的数据类型：{dtype}")
 
 
-def _interpolate_dataset(
+def _write_selected_dataset(
+    target: Any,
+    name: str,
     source: Any,
-    left: np.ndarray,
-    right: np.ndarray,
-    weight: np.ndarray,
+    selected: np.ndarray,
     valid: np.ndarray,
-) -> np.ndarray:
-    """Interpolate one Quest dataset row-wise, honouring each field's semantics.
-
-    Floats interpolate; booleans and integers take the left sample. A trailing
-    axis of 7 is treated as ``x, y, z, qx, qy, qz, qw`` so the position part can
-    be lerped while the rotation is renormalised.
-    """
-    name = source.name.rsplit("/", 1)[-1]
-    dtype = source.dtype
+    expected_rows: int,
+) -> None:
+    if source.ndim < 1:
+        raise AlignError(f"Quest 数据集 {source.name} 没有行轴")
+    if source.shape[0] != expected_rows:
+        raise AlignError(
+            f"Quest 数据集 {source.name} 行数 {source.shape[0]} "
+            f"与 sdk_timestamp_ns 行数 {expected_rows} 不一致"
+        )
     row_shape = source.shape[1:]
-    fill = _missing_value(dtype, name)
-    out = np.full((left.size,) + row_shape, fill, dtype=dtype)
-    if not np.any(valid):
-        return out
-
-    picked_left = np.asarray(source[left[valid]])
-    if np.issubdtype(dtype, np.bool_) or np.issubdtype(dtype, np.integer):
-        # 序号、计数、时间戳、按键：插值会造出不存在的状态，取前驱。
-        out[valid] = picked_left
-        return out
-
-    picked_right = np.asarray(source[right[valid]])
-    w = np.asarray(weight[valid], dtype=np.float64)
-    a = picked_left.astype(np.float64)
-    b = picked_right.astype(np.float64)
-    if source.ndim >= 2 and source.shape[-1] == 7:
-        mixed = _interp_pose_rows(a, b, w)
-    else:
-        work = w.reshape((-1,) + (1,) * (a.ndim - 1))
-        mixed = a * (1.0 - work) + b * work
-    out[valid] = mixed.astype(dtype)
-    return out
+    out = target.create_dataset(
+        name,
+        shape=(selected.size,) + row_shape,
+        dtype=source.dtype,
+    )
+    _copy_attrs(source, out)
+    fill = _missing_value(source.dtype, name)
+    chunk = 512
+    for start in range(0, selected.size, chunk):
+        stop = min(start + chunk, selected.size)
+        idx = selected[start:stop]
+        ok = valid[start:stop]
+        block = np.full((idx.size,) + row_shape, fill, dtype=source.dtype)
+        if np.any(ok):
+            block[ok] = source[idx[ok]]
+        out[start:stop] = block
 
 
-def _write_interpolated_group(
+def _write_selected_group(
     target: Any,
     source: Any,
-    left: np.ndarray,
-    right: np.ndarray,
-    weight: np.ndarray,
+    selected: np.ndarray,
     valid: np.ndarray,
     expected_rows: int,
 ) -> None:
     _copy_attrs(source, target)
     for name, item in source.items():
         if isinstance(item, h5py.Dataset):
-            if item.ndim < 1:
-                raise AlignError(f"Quest 数据集 {item.name} 没有行轴")
-            if item.shape[0] != expected_rows:
-                raise AlignError(
-                    f"Quest 数据集 {item.name} 行数 {item.shape[0]} "
-                    f"与 sdk_timestamp_ns 行数 {expected_rows} 不一致"
-                )
-            data = _interpolate_dataset(item, left, right, weight, valid)
-            dataset = target.create_dataset(name, data=data, dtype=item.dtype)
-            _copy_attrs(item, dataset)
+            _write_selected_dataset(
+                target,
+                name,
+                item,
+                selected,
+                valid,
+                expected_rows,
+            )
         elif isinstance(item, h5py.Group):
             child = target.create_group(name)
-            _write_interpolated_group(
-                child, item, left, right, weight, valid, expected_rows
+            _write_selected_group(
+                child,
+                item,
+                selected,
+                valid,
+                expected_rows,
             )
         else:
             raise AlignError(f"Quest 组含不支持的 HDF5 对象：{item.name}")
@@ -1043,14 +1013,11 @@ def write_quest_alignment(
     if not isinstance(payload, dict):
         return
     group = out.create_group("quest")
-    # index/right_index 是插值两端在源文件里的行号；span_ms 是这个区间的宽度，
-    # 也就是这一行插值可信度的唯一指标（与 glove/span_ms 同理）。
+    # index = 选中的源行号；age_ms = 该行时刻比目标早多少毫秒，也就是这一行的
+    # 滞后。下游要过滤「太旧」的行就看 age_ms，作用与 glove/span_ms 对应。
     group.create_dataset("index", data=payload["index"], dtype=np.int64)
-    group.create_dataset("right_index", data=payload["right_index"], dtype=np.int64)
-    group.create_dataset("weight", data=payload["weight"], dtype=np.float64)
     group.create_dataset("valid", data=payload["valid"], dtype=bool)
     group.create_dataset("age_ms", data=payload["age_ms"], dtype=np.float64)
-    group.create_dataset("span_ms", data=payload["span_ms"], dtype=np.float64)
     group.create_dataset(
         "timestamp_sdk_ns",
         data=payload["timestamp_sdk_ns"],
@@ -1063,8 +1030,8 @@ def write_quest_alignment(
     )
     group.attrs["alignment"] = str(payload["mode"])
     group.attrs["selection"] = (
-        "interpolated between the two samples bracketing the target: "
-        "xyz lerp, quaternion nlerp, flags/ids take the left sample"
+        "last valid source row at or before the target; rows are copied whole, "
+        "age_ms records the resulting lag"
     )
     group.attrs["max_age_ms"] = float(payload["max_age_ms"])
     if payload.get("clock_report_sha256"):
@@ -1080,12 +1047,10 @@ def write_quest_alignment(
         if "quest" not in source:
             raise AlignError("写出时发现源文件缺少 quest/ 组")
         data_group = group.create_group("data")
-        _write_interpolated_group(
+        _write_selected_group(
             data_group,
             source["quest"],
             np.asarray(payload["index"], dtype=np.int64),
-            np.asarray(payload["right_index"], dtype=np.int64),
-            np.asarray(payload["weight"], dtype=np.float64),
             np.asarray(payload["valid"], dtype=bool),
             int(payload["source_rows"]),
         )
@@ -1180,18 +1145,17 @@ def aligned_summary(result: dict[str, Any]) -> dict[str, Any]:
                 )
                 for key, value in quest["age_stats_ms"].items()
             },
-            "span_ms": {
-                key: (
-                    None
-                    if value is None
-                    else round(float(value), 3)
-                )
-                for key, value in quest["span_stats_ms"].items()
-            },
             "source_timestamp_quality": quest["quality"],
             "quality_warnings": list(quest["quality_warnings"]),
             "clock_domain_verified": quest["mode"] == QUEST_ALIGNMENT_SDK_UNIX,
             "clock_report_sha256": quest["clock_report_sha256"],
+        }
+    elif result.get("quest_alignment") in QUEST_ALIGNMENT_ACTIVE:
+        quest_summary = {
+            "enabled": True,
+            "alignment": result["quest_alignment"],
+            "available": False,
+            "skipped_reason": result.get("quest_skipped_reason"),
         }
     else:
         quest_summary = {"enabled": False, "alignment": QUEST_ALIGNMENT_NONE}
@@ -1266,20 +1230,15 @@ def report(result: dict[str, Any], path: Path | None, delay_source: str) -> None
     quest = result.get("quest")
     if isinstance(quest, dict):
         age = quest["age_stats_ms"]
-        span_stats = quest["span_stats_ms"]
         log(
-            "  Quest：{} 行 → 插值配对 {} 行（{:.1f}%），年龄 median/p99/max "
-            "{:.2f}/{:.2f}/{:.2f} ms，插值跨度 median/p95/max "
-            "{:.2f}/{:.2f}/{:.2f} ms（上限年龄 {:.1f} ms）".format(
+            "  Quest：{} 行 → 配对 {} 行（{:.1f}%），滞后 median/p99/max "
+            "{:.2f}/{:.2f}/{:.2f} ms（上限 {:.1f} ms）".format(
                 quest["source_rows"],
                 quest["paired_rows"],
                 quest["valid_fraction"] * 100.0,
                 age["median"] or 0.0,
                 age["p99"] or 0.0,
                 age["max"] or 0.0,
-                span_stats["median"] or 0.0,
-                span_stats["p95"] or 0.0,
-                span_stats["max"] or 0.0,
                 quest["max_age_ms"],
             )
         )
@@ -1292,6 +1251,11 @@ def report(result: dict[str, Any], path: Path | None, delay_source: str) -> None
                 warn(f"  Quest 时间戳质量提示：{message}")
         if quest["clock_report_sha256"]:
             log(f"  C8 报告 SHA256：{quest['clock_report_sha256']}")
+    elif result.get("quest_alignment") in QUEST_ALIGNMENT_ACTIVE:
+        log(
+            "  Quest：已请求对齐但没有数据，本次跳过"
+            f"（{result.get('quest_skipped_reason') or '未知原因'}）"
+        )
     else:
         log("  Quest：未处理（--quest-align none）")
     if path is not None:
@@ -1375,10 +1339,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quest-align",
         choices=QUEST_ALIGNMENT_CHOICES,
-        default=QUEST_ALIGNMENT_NONE,
+        default=QUEST_ALIGNMENT_UNIX,
         help=(
-            "none=不处理 Quest；unix=SDK 时间戳就是主机墙钟，直接插入相机网格"
-            "（不需要 C8 报告）；sdk_unix=先按 C8 报告的时钟模型换算再插入"
+            "默认 unix=SDK 时间戳就是主机墙钟，直接对齐（不需要 C8 报告）；"
+            "sdk_unix=先按 C8 报告的时钟模型换算；none=不处理 Quest。"
+            "文件里没有 Quest 数据时自动跳过，不报错"
         ),
     )
     parser.add_argument(
@@ -1399,7 +1364,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_QUEST_MIN_VALID_FRACTION,
         help=(
             "Quest 有效配对比例门槛，默认 "
-            f"{DEFAULT_QUEST_MIN_VALID_FRACTION:g}；未达标即不写输出文件"
+            f"{DEFAULT_QUEST_MIN_VALID_FRACTION:g}；仅 sdk_unix 模式生效"
+            "（未达标即不写输出文件），unix 模式只提示"
         ),
     )
     return parser

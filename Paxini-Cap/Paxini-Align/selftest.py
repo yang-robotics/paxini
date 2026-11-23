@@ -494,8 +494,8 @@ def test_quest_duplicate_tie_break(tmp: Path) -> None:
     )
 
 
-def test_quest_unix_mode_interpolates(tmp: Path) -> None:
-    """unix 模式：不要 C8 报告，位姿按时间线性插值，四元数保持单位长度。"""
+def test_quest_unix_mode_takes_previous_row(tmp: Path) -> None:
+    """unix 模式：不要 C8 报告，整行取前驱，逐行记录滞后。"""
     # 不带单调钟列，时间基才会选 unix —— 于是 timestamp_ns 本身就是 Unix，
     # 可以直接和合成 Quest 的 sdk 时间戳逐行比。
     rec = make_recording(tmp, with_mono=False)
@@ -506,44 +506,29 @@ def test_quest_unix_mode_interpolates(tmp: Path) -> None:
     with h5py.File(out) as f:
         ts = f["timestamp_ns"][:].astype(np.int64)
         pose = f["quest/data/pose_6d"][:]
+        sdk_rows = f["quest/data/sdk_timestamp_ns"][:].astype(np.int64)
         sequence = f["quest/data/sequence"][:]
-        interp_flag = f["quest/data/tracked"][:]
-    # 合成数据里 pose.x = (sdk - t0) / 1e9，所以插值正确的判据是逐行精确相等。
-    expected = (ts - 1_700_000_000_000_000_000) / 1e9
-    error = np.abs(pose[:, 0] - expected)
-    norm = np.linalg.norm(pose[:, 3:7], axis=1)
+        age = f["quest/age_ms"][:]
+        valid = f["quest/valid"][:]
+    # 整行复制：pose.x 必须精确等于「这一行自己那条 sdk」换算出来的值，
+    # 只要有一点插值就不可能逐位相等。合成数据里 pose.x = (sdk - t0)/1e9。
+    expected_from_row = (sdk_rows - 1_700_000_000_000_000_000) / 1e9
     check(
-        "unix 模式免 C8 报告，位姿插值与时间线性一致",
+        "unix 模式免 C8 报告，Quest 整行取前驱",
         quest["mode"] == ac.QUEST_ALIGNMENT_UNIX
         and quest["valid_fraction"] > 0.9
-        and float(error.max()) < 1e-6,
+        and float(np.abs(pose[:, 0] - expected_from_row).max()) < 1e-12,
         f"mode={quest['mode']} 有效={quest['valid_fraction']:.3f} "
-        f"最大误差={float(error.max()):.2e}",
+        f"偏差={float(np.abs(pose[:, 0] - expected_from_row).max()):.2e}",
     )
+    # 前驱的代价是滞后，但必须被限制在一个采样间隔内并如实记录。
     check(
-        "四元数插值后仍是单位长度",
-        float(np.abs(norm - 1.0).max()) < 1e-9,
-        f"max |norm-1| = {float(np.abs(norm - 1.0).max()):.2e}",
-    )
-    check(
-        "整数与布尔字段取左邻而非插值",
-        np.all(np.diff(sequence.astype(np.int64)) >= 0)
-        and bool(np.all(interp_flag)),
-        f"sequence 单调={bool(np.all(np.diff(sequence.astype(np.int64)) >= 0))}",
-    )
-
-
-def test_quat_nlerp(tmp: Path) -> None:
-    """四元数走短弧：q 与 -q 表示同一旋转，插值结果必须一致。"""
-    a = np.array([[0.0, 0.0, 0.0, 1.0]])
-    b = np.array([[0.0, 0.0, 0.7071068, 0.7071068]])      # 绕 z 轴 90°
-    mid = ac._nlerp_quat(a, b, np.array([0.5]))
-    same_arc = np.allclose(mid, ac._nlerp_quat(a, -b, np.array([0.5])), atol=1e-12)
-    check(
-        "四元数 nlerp 走短弧并归一化",
-        same_arc and abs(float(mid[0, 3]) - 0.9238795) < 1e-5
-        and abs(float(np.linalg.norm(mid[0]))) - 1.0 < 1e-12,
-        f"q=({float(mid[0, 2]):.4f},{float(mid[0, 3]):.4f}) 反号一致={same_arc}",
+        "滞后 age_ms ∈ [0, 一个采样间隔]，且与时间轴一致",
+        float(np.nanmax(age[valid])) <= 8.34 + 1e-6
+        and float(np.nanmin(age[valid])) >= 0.0
+        and int(sequence.size) == int(ts.size),
+        f"age 范围 {float(np.nanmin(age[valid])):.2f}~"
+        f"{float(np.nanmax(age[valid])):.2f} ms",
     )
 
 
@@ -903,8 +888,7 @@ def main() -> int:
             test_timebase_selection, test_multi_camera_views, test_write_and_reopen,
             test_gates_pass, test_clock_offset_column, test_quality_gate_blocks_write, test_rejects_unsorted, test_write_flag_repair, test_lookup3_vector,
             test_quest_causal_pairing, test_quest_duplicate_tie_break,
-            test_quest_unix_mode_interpolates,
-            test_quat_nlerp,
+            test_quest_unix_mode_takes_previous_row,
             test_quest_unix_mode_tolerates_low_quality,
             test_quest_clock_model_inverse,
             test_quest_missing_semantics, test_quest_full_group_written,
