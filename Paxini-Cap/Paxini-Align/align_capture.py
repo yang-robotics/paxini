@@ -610,14 +610,21 @@ def align_recording(
             raise AlignError("手套时间戳非严格递增（墙钟被校时过？），先按 DOC/时间戳说明.md §4.1 处理")
 
         jumps = 0
-        if (
-            (tb == "unix" or quest_alignment == QUEST_ALIGNMENT_SDK_UNIX)
-            and has_mono(handle["cap"])
-        ):
-            jumps = detect_clock_jumps(
-                np.asarray(handle["cap"]["timestamp_unix_ns"][:], dtype=np.int64),
-                np.asarray(handle["cap"]["timestamp_monotonic_ns"][:], dtype=np.int64),
+        cap_offset_ns: np.ndarray | None = None
+        if has_mono(handle["cap"]):
+            cap_unix = np.asarray(
+                handle["cap"]["timestamp_unix_ns"][:], dtype=np.int64
             )
+            cap_mono = np.asarray(
+                handle["cap"]["timestamp_monotonic_ns"][:], dtype=np.int64
+            )
+            if cap_unix.shape == cap_mono.shape:
+                # 墙钟 − 单调钟。同一份采集内这个值应当是常数，出现台阶就是
+                # NTP 校时。逐帧留着，事后才能定位到「哪一行开始不可比」，
+                # 只记一个跳变次数是不够查的。
+                cap_offset_ns = cap_unix - cap_mono
+                if tb == "unix" or quest_alignment == QUEST_ALIGNMENT_SDK_UNIX:
+                    jumps = detect_clock_jumps(cap_unix, cap_mono)
         if quest_alignment == QUEST_ALIGNMENT_SDK_UNIX and jumps:
             raise AlignError(
                 f"采集期间手套墙钟发生 {jumps} 次跳变，Quest 跨源绝对时间对齐不可信"
@@ -718,6 +725,11 @@ def align_recording(
 
         left, right, w = bracket_indices(glove_t, master_t)
 
+        # 每行取它所依赖的左邻手套帧的时钟偏移，粘在样本行上。
+        clock_offset_ns = (
+            cap_offset_ns[left].astype(np.int64) if cap_offset_ns is not None else None
+        )
+
         state: dict[str, np.ndarray] = {}
         cap = handle["cap"]
         for name in LINEAR_STATE:
@@ -802,6 +814,7 @@ def align_recording(
         "dropped_by_camera": dropped_by_camera,
         "dropped_by_quest": dropped_by_quest,
         "clock_jumps": jumps,
+        "clock_offset_ns": clock_offset_ns,
         "holes": holes,
         "state": state,
         "views": views,
@@ -966,6 +979,11 @@ def write_aligned(result: dict[str, Any], output_dir: Path) -> Path:
 
         glove = out.create_group("glove")
         glove.create_dataset("left_index", data=result["glove_left"], dtype=np.int32)
+        if result.get("clock_offset_ns") is not None:
+            # 墙钟 − 单调钟，逐行。正常是常数（几个 µs 的抖动），台阶 = 校时。
+            glove.create_dataset(
+                "clock_offset_ns", data=result["clock_offset_ns"], dtype=np.int64
+            )
         glove.create_dataset("right_index", data=result["glove_right"], dtype=np.int32)
         glove.create_dataset("span_ms", data=result["glove_span_ms"], dtype=np.float64)
         glove.create_dataset("offset_ms", data=result["glove_offset_ms"], dtype=np.float64)
@@ -992,6 +1010,25 @@ def write_aligned(result: dict[str, Any], output_dir: Path) -> Path:
         out.attrs["summary"] = json.dumps(aligned_summary(result), ensure_ascii=False)
         write_quest_alignment(out, Path(result["recording"]), result)
     return path
+
+
+def _clock_offset_summary(offset_ns: np.ndarray | None) -> dict[str, Any] | None:
+    """Spread of (wall − monotonic) across the aligned rows.
+
+    Zero spread means the wall clock was never stepped during the capture; a
+    nonzero spread is the size of the steps, in milliseconds. ``None`` when the
+    file has no monotonic column (every V4L2 camera, but the glove does).
+    """
+    if offset_ns is None or offset_ns.size == 0:
+        return None
+    values = offset_ns.astype(np.int64)
+    steps = np.abs(np.diff(values)) if values.size > 1 else np.zeros(0, dtype=np.int64)
+    return {
+        # 绝对值本身没有意义（Unix 纪元 vs 开机计数），只看它是否稳定。
+        "spread_ms": round(float(values.max() - values.min()) / 1e6, 3),
+        "max_step_ms": round(float(steps.max()) / 1e6, 3) if steps.size else 0.0,
+        "steps_over_5ms": int(np.count_nonzero(steps > 5_000_000)),
+    }
 
 
 def aligned_summary(result: dict[str, Any]) -> dict[str, Any]:
@@ -1051,6 +1088,7 @@ def aligned_summary(result: dict[str, Any]) -> dict[str, Any]:
         },
         "camera_holes": result["holes"],
         "clock_jumps": result["clock_jumps"],
+        "clock_offset_ms": _clock_offset_summary(result.get("clock_offset_ns")),
         "distribution_force": result["distribution"],
         "quest": quest_summary,
     }

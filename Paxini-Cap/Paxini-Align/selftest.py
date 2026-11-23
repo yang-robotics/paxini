@@ -706,7 +706,37 @@ def test_gates_pass(tmp: Path) -> None:
     check("质量判据对合成数据全过", not problems, "；".join(problems) or "无问题")
 
 
+def test_clock_offset_column(tmp: Path) -> None:
+    """每行都要带手套的墙钟−单调钟偏移，跳变要能在这一列上看出来。"""
+    rec = make_recording(tmp)
+    result = run(rec)
+    offset = result.get("clock_offset_ns")
+    check(
+        "时钟偏移随行输出（常数偏移）",
+        offset is not None and int(np.unique(offset).size) == 1,
+        "None" if offset is None else f"{int(np.unique(offset).size)} 个不同值",
+    )
+
+    # 造一次 NTP 阶跃：墙钟整体前跳 2 s，单调钟不动。三列都有的合成文件会
+    # 让时间基选 mono，所以主时间轴不受影响，只有 offset 列能看见这次跳变。
+    stepped = make_recording(tmp / "stepped")
+    with h5py.File(stepped / "data.h5", "r+") as f:
+        unix = f["cap/timestamp_unix_ns"][:]
+        unix[100:] += 2_000_000_000
+        del f["cap/timestamp_unix_ns"]
+        f["cap"].create_dataset("timestamp_unix_ns", data=unix)
+    result = run(stepped)
+    summary = ac.aligned_summary(result)
+    check(
+        "跳变被记进 clock_offset_ms（spread ≈ 2000 ms）",
+        summary["clock_offset_ms"]["spread_ms"] > 1000.0
+        and summary["clock_offset_ms"]["steps_over_5ms"] >= 1,
+        str(summary["clock_offset_ms"]),
+    )
+
+
 def test_quality_gate_blocks_write(tmp: Path) -> None:
+
     """质量判据不过时不写产物、退出码非 0。
 
     这是删掉 --strict 之后的唯一口径：判据在写文件之前跑，不合格就没有文件，
@@ -796,7 +826,7 @@ def main() -> int:
             test_windows_no_overlap,
             test_nearest_integer, test_counts_nearest, test_omit_distribution,
             test_timebase_selection, test_multi_camera_views, test_write_and_reopen,
-            test_gates_pass, test_quality_gate_blocks_write, test_rejects_unsorted, test_write_flag_repair, test_lookup3_vector,
+            test_gates_pass, test_clock_offset_column, test_quality_gate_blocks_write, test_rejects_unsorted, test_write_flag_repair, test_lookup3_vector,
             test_quest_causal_pairing, test_quest_duplicate_tie_break,
             test_quest_clock_model_inverse,
             test_quest_missing_semantics, test_quest_full_group_written,

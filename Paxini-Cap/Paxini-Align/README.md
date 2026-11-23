@@ -151,6 +151,7 @@ Quest 选样是**因果的**：对每个相机目标时刻，在换算到主机 
 | `glove/span_ms` | (K,) | float64 | 两帧间距；**这是插值可信度的唯一指标** |
 | `glove/offset_ms` | (K,) | float64 | 距左邻帧多少毫秒 |
 | `glove/interpolated` | (K,) | bool | 是否真的插值（正好落在手套帧上时为 False） |
+| `glove/clock_offset_ns` | (K,) | int64 | 该行左邻手套帧的**墙钟 − 单调钟**。正常是常数；出现台阶就是采集中途被 NTP 校过时，台阶之后的行不可与之前混比 |
 | `state/joint_angles_deg` | (K,4) | float64 | 4 路关节角，**线性插值** |
 | `state/encoder_raw` | (K,4) | int32 | 4 路编码器，**最近邻**（计数器不是信号，不能平均） |
 | `state/resultant_force` | (K,10,3) | int16 | 10 路合力（0.1 N），线性插值后取整 |
@@ -167,8 +168,10 @@ Quest 选样是**因果的**：对每个相机目标时刻，在换算到主机 
 | `quest/data/...` | (K,...) | 原类型 | 完整 `quest/` 数据组按所选行复制，保留嵌套组和属性 |
 
 `attrs["summary"]` 是一份 JSON 摘要（行数、`kept_rows`、按来源的丢弃计数、公共有效窗口、
-跨度分位、延迟值与 `camera_delay_source`、时钟跳变数）。Quest 启用时还会包含 C8 报告
-SHA-256、有效配对比例和年龄分位。`--delay-ms` 没给、台账也读不到时，
+跨度分位、延迟值与 `camera_delay_source`、时钟跳变数、`clock_offset_ms{spread_ms,
+max_step_ms, steps_over_5ms}`）。Quest 启用时还会包含 C8 报告 SHA-256、有效配对比例和
+年龄分位。`clock_offset_ms.spread_ms > 0` 就说明采集期间墙钟被调过，具体哪一行翻的看
+`glove/clock_offset_ns` 自己求差分。`--delay-ms` 没给、台账也读不到时，
 `camera_delay_source` 会写成「未标定 Δ=0（台账不可用，未做延迟补偿）」——看到这句就说明
 这份产物**没有做延迟补偿**，别拿去和带 Δ 的产物混训。
 `attrs["format_version"]` = **2**，与采集端的 `format_version` 4 是两套编号。
