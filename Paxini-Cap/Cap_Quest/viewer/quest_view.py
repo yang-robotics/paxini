@@ -1,8 +1,15 @@
 """Read-only Quest 3 payload builder for the replay viewer.
 
-The module does not align Quest samples with glove or camera rows. Quest
-timestamps remain on their own SDK time base, and the viewer labels that
-contract explicitly.
+The module never resamples Quest onto the camera grid -- that is
+``align_capture.py``'s job. It only decides which time axis to *draw* on:
+
+* ``unix`` (default) -- render the SDK stamps as seconds relative to the glove's
+  first frame, i.e. the same wall-clock axis the aligner uses.
+* ``sdk_unix`` -- same axis, but through a passing C8 report's affine model.
+* ``none`` -- keep Quest on its own SDK time base (normalised progress).
+
+The payload says which one it used, and the viewer labels the difference between
+"aligned but unverified" and "aligned and C8-verified" explicitly.
 """
 
 from __future__ import annotations
