@@ -42,7 +42,8 @@ Quest 的有效区间也可能比相机窄。所以主轴按**四路窗口的交
 | 手套 | `[cap/timestamp_unix_ns[0], [−1]]` |
 | Quest（默认启用） | 有效行（时间戳 > 0）映射到主机 Unix 后的首末；没有 Quest 数据时不参与 |
 
-窗口外的整行丢弃，`--keep-outside` 只影响是否真的裁掉，计数照算。`summary` 里按来源分开记账：
+窗口外的整行**一律丢弃**，没有「保留但标记」的口子：那些帧没有真实的手套数据，插值只会钳到
+边界帧、产出一串克隆值而 `span_ms` 看不出异常。`summary` 里按来源分开记账：
 
 ```json
 "dropped_outside_overlap": 214,
@@ -178,7 +179,6 @@ python3.10 align_capture.py <采集目录> \
 | `glove/span_ms` | (K,) | float64 | 两帧间距；**这是插值可信度的唯一指标** |
 | `glove/offset_ms` | (K,) | float64 | 距左邻帧多少毫秒 |
 | `glove/interpolated` | (K,) | bool | 是否真的插值（正好落在手套帧上时为 False） |
-| `glove/extrapolated` | (K,) | bool | 正交于上一条：该行落在手套覆盖范围外，数值是边界帧的克隆。**只有 `--keep-outside` 时存在这一列** |
 | `glove/clock_offset_ns` | (K,) | int64 | 该行左邻手套帧的**墙钟 − 单调钟**。正常是常数；出现台阶就是采集中途被 NTP 校过时，台阶之后的行不可与之前混比 |
 | `state/joint_angles_deg` | (K,4) | float64 | 4 路关节角，**线性插值** |
 | `state/encoder_raw` | (K,4) | int32 | 4 路编码器，**最近邻**（计数器不是信号，不能平均） |
@@ -225,7 +225,6 @@ cam1 用的是「主轴时刻之前最近的那一帧」，所以 `cameras/right
 | `--no-delay` | 关 | 不减延迟，只用于对照调试 |
 | `--omit-distribution` | 关 | 不输出 10×119×3，体积降一个量级 |
 | `--nearest-distribution` | 关 | 分布力只取最近帧，省一半读取 |
-| `--keep-outside` | 关 | 保留手套覆盖范围外的相机帧（默认丢弃） |
 | `--dry-run` | 关 | 只统计，不写文件 |
 | `--clear-write-flag` | 关 | `data.h5` 打不开时清写标志，见下 |
 | `--quest-align` | `unix` | `unix`（直接当主机墙钟，免报告）/ `sdk_unix`（需 C8 报告）/ `none`（不处理）；没有 Quest 数据时自动跳过 |
@@ -298,10 +297,10 @@ cam0 那条，两路共用。差 2.9 ms，相对半帧（33 ms）可忽略，所
 ## 自检
 
 ```bash
-python3 selftest.py     # 30 项，不需要硬件，用合成数据精确校验插值与 Quest 门控
+python3 selftest.py     # 38 项，不需要硬件，用合成数据精确校验插值与 Quest 门控
 ```
 
-覆盖：线性信号零误差还原、Δ 逐行精确相减、边界丢弃计数、`--keep-outside`、
+覆盖：线性信号零误差还原、Δ 逐行精确相减、边界丢弃计数、
 整数走最近邻、counts 合计 444、`--omit-distribution`、时间基自动判定、
 Quest 默认对齐、整行取前驱、滞后范围、无数据自动跳过、
 cam1 因果取帧（dt_ms 始终 ≤ 0）、输出可重开、质量判据不合格时不写文件、乱序时间戳必须报错，

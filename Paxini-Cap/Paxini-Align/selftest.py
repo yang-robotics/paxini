@@ -221,7 +221,7 @@ def make_clock_report(
 
 def run(rec: Path, **kwargs) -> dict:
     defaults = dict(reference=None, delay_ms=0.0, omit_distribution=False,
-                    interpolate_distribution=True, keep_outside=False)
+                    interpolate_distribution=True)
     defaults.update(kwargs)
     return ac.align_recording(rec, **defaults)
 
@@ -253,14 +253,6 @@ def test_outside_dropped(tmp: Path) -> None:
     dropped = int(result["dropped_outside"])
     check("覆盖范围外的相机帧被丢弃且计数正确",
           dropped > 0 and kept + dropped == total, f"保留 {kept} / 丢弃 {dropped} / 合计 {total}")
-
-
-def test_keep_outside(tmp: Path) -> None:
-    rec = make_recording(tmp)
-    result = run(rec, keep_outside=True)
-    check("--keep-outside 保留全部相机帧",
-          int(result["aligned_rows"]) == int(result["camera_rows"]),
-          f"{result['aligned_rows']} 行")
 
 
 def _window_counts(result: dict) -> int:
@@ -927,7 +919,7 @@ def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="align_selftest_"))
     try:
         tests = [
-            test_linear_exactness, test_delay_applied, test_outside_dropped, test_keep_outside,
+            test_linear_exactness, test_delay_applied, test_outside_dropped,
             test_window_second_camera_late, test_window_second_camera_early_end,
             test_window_camera_boundary_uses_delay, test_windows_in_summary,
             test_windows_no_overlap,

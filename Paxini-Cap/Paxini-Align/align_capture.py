@@ -668,7 +668,6 @@ def align_recording(
     delay_ms: float,
     omit_distribution: bool,
     interpolate_distribution: bool,
-    keep_outside: bool,
     clear_flag: bool = False,
     quest_alignment: str = QUEST_ALIGNMENT_NONE,
     quest_clock_report: dict[str, Any] | None = None,
@@ -822,19 +821,12 @@ def align_recording(
                 keep &= quest_ok
 
         dropped = int(keep.size - np.count_nonzero(keep))
-        extrapolated: np.ndarray | None = None
-        if not keep_outside:
-            master_t = master_t[keep]
-            master_unix_t = master_unix_t[keep]
-            ref_raw = reference_t[keep]
-            ref_index = np.flatnonzero(keep).astype(np.int32)
-        else:
-            ref_raw = reference_t
-            ref_index = np.arange(reference_t.size, dtype=np.int32)
-            # --keep-outside 保留了落在窗口外的帧。它们没有真实的手套数据，
-            # bracket 会 clamp 到首/末帧，于是这些行的关节角等于边界帧的克隆，
-            # 而 span_ms 看起来完全正常。留一列掩码，别让下游把填充值当真值。
-            extrapolated = ~keep
+        # 窗口外一律丢弃，不留「保留但仍标记」的口子：那些帧没有真实的手套数据，
+        # bracket 会钳到首/末帧，结果只是边界帧的克隆，而 span_ms 看起来完全正常。
+        master_t = master_t[keep]
+        master_unix_t = master_unix_t[keep]
+        ref_raw = reference_t[keep]
+        ref_index = np.flatnonzero(keep).astype(np.int32)
 
         if master_t.size == 0:
             raise AlignError(
@@ -897,7 +889,7 @@ def align_recording(
         views: dict[str, dict[str, np.ndarray]] = {}
         for slot in slots:
             series = cam_times[slot]
-            if slot == reference and not keep_outside:
+            if slot == reference:
                 views[slot] = {
                     "frame_index": ref_index,
                     "dt_ms": np.zeros(master_t.size, dtype=np.float32),
@@ -944,7 +936,6 @@ def align_recording(
         "glove_left": left.astype(np.int32),
         "glove_right": right.astype(np.int32),
         "weights": w,
-        "extrapolated": extrapolated,
         "glove_span_ms": span_ns.astype(np.float64) / 1e6,
         "glove_offset_ms": offset_ns.astype(np.float64) / 1e6,
         "distribution": distribution_note,
@@ -1121,9 +1112,6 @@ def write_aligned(result: dict[str, Any], output_dir: Path) -> Path:
         # True only when the camera instant actually fell between two glove frames;
         # a row that lands on a glove frame needs no interpolation.
         glove.create_dataset("interpolated", data=(weights > 1e-9) & (weights < 1.0 - 1e-9))
-        if result.get("extrapolated") is not None:
-            # True = 该行落在手套覆盖范围之外，数值是边界帧的克隆（--keep-outside）
-            glove.create_dataset("extrapolated", data=result["extrapolated"], dtype=bool)
 
         state = out.create_group("state")
         for name, values in result["state"].items():
@@ -1222,11 +1210,6 @@ def aligned_summary(result: dict[str, Any]) -> dict[str, Any]:
         "dropped_by_quest": result.get("dropped_by_quest", 0),
         "valid_windows": result.get("windows", {}),
         "interpolated_rows": interpolated,
-        "extrapolated_rows": (
-            int(np.count_nonzero(result["extrapolated"]))
-            if result.get("extrapolated") is not None
-            else 0
-        ),
         "glove_span_ms": {
             "median": round(float(np.median(span)), 3),
             "p95": round(float(np.percentile(span, 95)), 3),
@@ -1266,11 +1249,6 @@ def report(result: dict[str, Any], path: Path | None, delay_source: str) -> None
         )
     log("  插值跨度 median {:.2f} ms / p95 {:.2f} ms / max {:.2f} ms".format(
         span_stats["median"], span_stats["p95"], span_stats["max"]))
-    if summary["extrapolated_rows"]:
-        warn(
-            f"{summary['extrapolated_rows']}/{result['aligned_rows']} 行落在手套覆盖范围外，"
-            "数值是边界帧的克隆（glove/extrapolated=true）；--keep-outside 只用于调试"
-        )
     ratio = summary["interpolated_rows"] / max(result["aligned_rows"], 1)
     log(f"  真插值 {summary['interpolated_rows']} 行（{ratio * 100:.1f}%），其余正好落在手套帧上")
     log(f"  相机空洞 {result['holes']} 处（>{HOLE_FACTOR}× 中位间隔）")
@@ -1385,8 +1363,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--omit-distribution", action="store_true", help="不输出 10x119x3 分布力")
     parser.add_argument("--nearest-distribution", action="store_true",
                         help="分布力只取最近帧，不做插值（省一半读取）")
-    parser.add_argument("--keep-outside", action="store_true",
-                        help="保留落在手套覆盖范围外的相机帧（默认丢弃）")
     parser.add_argument("--dry-run", action="store_true", help="只统计，不写文件")
     parser.add_argument("--clear-write-flag", action="store_true",
                         help="采集被强杀导致 data.h5 打不开时，清掉超级块里的写标志（等价 h5clear -s）")
@@ -1476,7 +1452,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 delay_ms=delay_ms,
                 omit_distribution=args.omit_distribution,
                 interpolate_distribution=not args.nearest_distribution,
-                keep_outside=args.keep_outside,
                 clear_flag=args.clear_write_flag,
                 quest_alignment=args.quest_align,
                 quest_clock_report=quest_report,
