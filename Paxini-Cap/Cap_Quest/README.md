@@ -84,23 +84,38 @@ python3.10 capture/collect_cap.py --no-quest           # 没有头显时只采�
 python3.10 capture/collect_cap.py --camera-mode none   # 不录视频
 ```
 
-**三个来源各自启动，互不等待**（2026-11-20 起）。启动只有两类处置：
+**三个来源各自启动，互不等待**（2026-11-20 起；2026-11-23 删掉就绪期）。
+**配置了就算必需**：哪一路停了，整场录制就中止，不再有「缺一路照样录完」的降级。
 
 ```text
-手套       必需。连接/启动失败 → 直接按启动失败退出，不生成 data.h5
-相机       每路独立。起不来或超时只让这一路失败，记进 manifest.cameras
-Quest      可选。PC Service / ADB / 轮询起不来只告警，继续采手套与相机
+手套       始终必需。连接/启动失败 → 按启动失败退出，不生成 data.h5
+相机       由 --camera-mode 决定。启动失败 → 启动失败退出（只录一路用 --camera-mode cam0）
+Quest      由 --no-quest 决定。装配失败（PC Service / ADB / SDK）→ 启动失败退出，不生成 data.h5
 ```
 
-不再有「先等 Quest 连续 3 帧 pose，再起相机，再起手套」的串行等待：那会让一个没戴头显
-的会话白等 120 秒，而相机其实早就该开录了。现在三路都在采集循环开始前各自启动，
-**就绪检测搬进采集循环**（10 Hz 轮询），所以：
+不戴头显就别靠“配了但没连”蒙混过去：显式加 `--no-quest`，否则程序按「配置了就得在场」
+处理，直接判启动失败。
 
-- 相机仍需确认真的出帧（否则会录出 0 帧 mkv），判据是「连续 `--camera-ready-samples`
-  帧有进度」，超过 `--camera-start-timeout` 只停掉这一路并写 `camera_errors`；
-- Quest 超过 `--quest-start-timeout` 没有有效 pose 只打一条警告，后到的样本照样入表；
-- 三路的起止时刻必然不同，manifest 分别记 `hand.first/last_timestamp_unix_ns`、
-  `cameras.per_camera.<id>.first/last_timestamp_unix_ns`、`quest.first/last_sdk_timestamp_ns`。
+启动阶段没有就绪检测、也不等待。检查全部发生在采集循环里（`RuntimeMonitor`）：
+
+| 检查 | 频率 | 判据 | 处置 |
+|---|---|---|---|
+| 相机进程 | 1 Hz | `process.poll()` 非空 | 中止整场 |
+| 相机出帧 | **0.5 Hz** | 启动宽限（`--camera-start-timeout`，15 s）过后 4 s 进度不增长；从没出过帧也走这一条 | 中止整场 |
+| Quest 轮询 | 1 Hz | `failure` 非空（线程内异常，`QuestPoller` 自己也会中止）；或 5 s 内 `samples` 不增长（线程卡在 SDK 调用里） | 中止整场 |
+| 手套出帧 | 每帧记时刻 | 连续 3 s 无新帧（没有宽限期：手套要么立刻出数，要么就是坏了） | 中止整场 |
+
+中止不是崩溃：走 `abort_recording()` → `STOP_EVENT` → 正常收尾（排空队列、停相机、
+回填视频时间戳、写 manifest），`manifest.error` 写明原因，退出码 2。所以「中止」的
+产物是可读的，不是半份垃圾。
+
+`cameras.first_frame_s` 是「第一次采样看到进度增长」的时刻，受 0.5 Hz 采样限制，
+精度是 2 s 的整数倍，别拿它当精确的首帧延迟。
+
+**没配置的源不检查**：`--camera-mode none` 时相机列表为空，一条相机检查都不会跑；
+`--no-quest` 时压根没有轮询线程。三路的起止时刻必然不同，manifest 分别记
+`hand.first/last_timestamp_unix_ns`、`cameras.per_camera.<id>.first/last_timestamp_unix_ns`、
+`quest.first/last_sdk_timestamp_ns`。
 
 `--skip-adb` 可跳过 ADB，但必须自己先打开 XRoboToolkit 并开启 Tracking 和 Send。
 
@@ -229,8 +244,9 @@ HDF5 只存索引性质的时间戳。
 | `duration_s` / `sample_span_s` | 墙钟耗时 / 手套首末帧跨度 |
 | `alignment` | 固定 `none (raw per-source timestamps only)` |
 | `hand` | 手别 `side`、Quest 请求手别 `pose_side_requested`、串口、SN、SDK/固件版本、故障、回调耗时、队列溢出、**首末帧时刻** `first/last_timestamp_unix_ns` 与 `first/last_timestamp_monotonic_ns` |
-| `quest` | enabled、rows、samples_dropped、轮询次数与超时、**就绪** `ready` / `ready_wait_seconds` / `timed_out`、setup_error、**首末 SDK 时间戳** `first/last_sdk_timestamp_ns`（域未验证，只作增量参考） |
-| `cameras` | 每路设备、帧数、分辨率、实际 fps、时间窗、错误、`ready_at_s`；汇总 `ready` / `timed_out` / `ready_wait_seconds` |
+| `quest` | enabled、rows、samples_dropped、轮询次数与超时（`poller_overruns`）、`poller_alive`、setup_error、**`errors`**（被 `XrtReader.call` 吞掉的 getter 异常，按接口名各记一条）、**首末 SDK 时间戳** `first/last_sdk_timestamp_ns`（域未验证，只作增量参考） |
+| `cameras` | 每路设备、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s`；汇总 `first_frame_s` |
+| `runtime` | `abort_reason`（中止原因，正常结束为 null）、`configured_sources`、出帧检查频率与两个停滞阈值、`camera_stalls` / `glove_stalls` |
 | `verify` | 行数自检（`row_mismatch` 必须为空） |
 | `env` | python / numpy / h5py / ffmpeg 版本 |
 
@@ -466,8 +482,9 @@ HTTP 服务、页面、JPEG 缓冲、MJPEG 连接全在子进程里。两处细�
 
 #### 实时相机关键帧
 
-`--view` 打开时，每路相机默认在窗口底部给一帧缩略图（`--no-view-video` 关掉，
-`--view-video-fps` 默认 5、`--view-video-width` 默认 360）：
+`--view` 打开时，每路相机都会在窗口底部给一帧缩略图（`--view-video-fps` 默认 5、
+`--view-video-width` 默认 360）。没有单独的开关：不看视图就没有缩略图，
+开了视图就一定有——省掉一个只影响显示的布尔参数。
 
 - 实现是给**录制那条 ffmpeg 加第二个输出**：`-map 0:v -vf fps=5,scale=360:-2 -c:v mjpeg
   -f image2pipe pipe:1`，主进程读 stdout、按 SOI/EOI 切出完整 JPEG，只保留最新一帧。
@@ -480,14 +497,11 @@ HTTP 服务、页面、JPEG 缓冲、MJPEG 连接全在子进程里。两处细�
 
 也可以写进配置文件，省得每次敲：
 
-```json
-{
-  "view": true,
-  "view_fps": 20.0,
-  "view_video": true,
-  "view_video_fps": 5.0,
-  "view_video_width": 360
-}
+```yaml
+view: true
+view_fps: 20
+view_video_fps: 5
+view_video_width: 360
 ```
 
 `view` 改成 `true` 后默认开窗口，临时不想看就加 `--no-view`。
@@ -546,15 +560,12 @@ view: false              # 采集时开实时窗口
 | `--pose-source` | `controller` | `controller` / `hand` / `head`，只影响 `pose_6d` |
 | `--pose-side` | `auto` | `auto` 跟随 `--cap-side`；`left` / `right` 可显式覆盖 |
 | `--quest-rate` | `120` | Quest 轮询频率 |
-| `--quest-start-timeout` | `120` | 等待有效 Quest pose 的超时 |
-| `--quest-ready-samples` | `3` | 启动采集前要求的连续有效 pose 次数 |
 | `--camera-mode` | `both` | `both` / `cam0` / `cam1` / `none` |
 | `--no-cameras` | 关 | 等价 `--camera-mode none` |
 | `--camera-0` / `--camera-1` | `auto` | 指定 `/dev/videoN`；auto 按 sysfs 设备路径排序 |
 | `--camera-width` / `--camera-height` | `1280` / `720` | 请求分辨率 |
 | `--camera-fps` | `30` | 请求帧率 |
-| `--camera-start-timeout` | `15` | 等待相机出帧超时 |
-| `--camera-ready-samples` | `3` | 启动前每路要求的连续新帧数 |
+| `--camera-start-timeout` | `15` | 每路相机的启动宽限；宽限后 4 s 无新帧即中止整场 |
 | `--video-codec` | `copy` | `copy`（MJPEG 直通）/`h264`/`hevc`/`mjpeg` |
 | `--duration` | `0` | 采集秒数，0 表示到 Ctrl+C |
 | `--output-dir` | — | 默认 `<Paxini-Cap>/Recordings/data_<日期>_<序号>` |
@@ -562,9 +573,8 @@ view: false              # 采集时开实时窗口
 | `--view` / `--no-view` | `false` | 采集时开实时视图；配置文件可设 `view: true` |
 | `--view-mode` | `auto` | `auto` = 有显示会话用 `tk`、没有则用 `html`；`html` = 本地页面 `http://127.0.0.1:8765/`（fork 子进程，端口由子进程绑定后回报）；`tk` = matplotlib 独立子进程窗口 |
 | `--view-fps` | `20` | 实时窗口刷新率（`tk` 模式） |
-| `--view-video` / `--no-view-video` | `true` | 实时窗口底部显示相机关键帧（5 fps 抽帧，走录制 ffmpeg 的第二路输出） |
-| `--view-video-fps` | `5` | 实时预览的抽帧帧率 |
-| `--view-video-width` | `360` | 实时预览宽度，高度按比例 |
+| `--view-video-fps` | `5` | 相机缩略图的抽帧帧率（`--view` 打开时生效） |
+| `--view-video-width` | `360` | 相机缩略图宽度，高度按比例 |
 | `--no-quest` | 关 | 不采 Quest，跳过 PC Service/ADB 与 pose 等待 |
 | `--skip-adb` | 关 | 不装/不启动 Quest APK |
 | `--allow-usb-only` | 关 | 兼容旧参数；有 USB ADB 时本来就保留 USB |
@@ -689,7 +699,7 @@ ls -l /dev/serial/by-id/ /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 | 项 | 结果 |
 |---|---|
 | `py_compile` / `pyflakes` | 全过，0 告警 |
-| `selftest.py` | **全过**（项数以运行输出为准）（在原有覆盖之外增加 C8 时钟探针、sdk_unix 报告与当前文件质量门控、Quest 独立时间轴/sequence 降级和失败工件） |
+| `selftest.py` | 150 项，通过 149（在原有覆盖之外增加 C8 时钟探针、sdk_unix 报告与文件质量门控、Quest 独立时间轴/sequence 降级、失败工件、三源运行期检查 8 项）。唯一失败项是「启动失败工件」，本机缺 `ffprobe` 导致，装好 ffmpeg 的机器上应全过 |
 | `--list-devices` | 正常输出串口 / V4L2 节点 / ffmpeg |
 | 无设备时报错 | 退出码 **2**，保留 `startup_failure.json`，不创建 `data.h5` |
 | 相机延迟测量 | **两路都尚未实测**；任何旧路径的数都已经作废，不能沿用 |

@@ -239,8 +239,9 @@ V4L2 驱动在每次出帧的 `v4l2_buffer.flags` 里声明时钟类型（`TIMES
 | `alignment`                    | 固定为 `none (raw per-source timestamps only)`                                   |
 | `pose`                         | 主位姿来源、分量顺序、坐标系说明                                                              |
 | `hand`                         | 单只手套手别 `side`、Quest 请求手别 `pose_side_requested`、串口、SN、SDK/固件版本、故障、回调耗时、队列溢出 |
-| `quest`                        | `enabled`、`timestamp_source`、`timestamp_fields`、`rows`、`samples_dropped`、轮询次数 |
-| `cameras`                      | `backend`（固定 `linux`）、每路设备节点、帧数、分辨率、实际 fps、时间窗、错误 |
+| `quest`                        | `enabled`、`setup_error`、`errors`（被 `XrtReader.call` 吞掉的 getter 异常，按接口名记）、`timestamp_source`、`timestamp_fields`、`rows`、`samples_dropped`、`poller_alive`、轮询次数与 `poller_overruns` |
+| `cameras`                      | `backend`（固定 `linux`）、每路设备节点、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s` |
+| `runtime`                      | `abort_reason`（中止原因，正常结束为 null）、`configured_sources`、检查频率与停滞阈值、`camera_stalls`、`glove_stalls` |
 | `verify`                       | 行数自检结果（`row_mismatch` 必须为空）                                                   |
 | `env`                          | python / numpy / h5py / ffmpeg 版本                                             |
 

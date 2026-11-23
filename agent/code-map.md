@@ -16,8 +16,8 @@
 | 单只手套左右手选择 | `capture/collect_cap.py` | `HAND_SIDES`、`build_parser()`、`resolve_pose_side()`(:1622)、`main()` | `selftest` 的 "手别选择" 组 |
 | 启动失败诊断 | `capture/collect_cap.py` | `write_startup_failure()`(:1660)、`main()` 的 `finally` | `selftest` 的 "启动失败工件" 组 |
 | 采集主循环节拍 | `capture/collect_cap.py` | `pump_and_record()`(:2073) | 跑一次采集看 `manifest.row_mismatch` |
-| **三源起停与就绪检测** | `capture/collect_cap.py` | `QuestReadiness`(:1217)、`CaptureReadiness`(:1995)、`main()` 启动段 | 合成脚本验「相机起不来手套照常」；真机看 manifest 三路起止时刻不同 |
-| 相机就绪判定（非阻塞） | `capture/camera_ffmpeg.py` | `CameraReadiness`(:642)、`wait_for_cameras_ready()`(:716) | `selftest` 视频组；阻塞版只留给脚本 |
+| **三源起停与运行期检查** | `capture/collect_cap.py` | `RuntimeMonitor`(:1863)、`abort_recording()`(:186)、`main()` 启动段 | `selftest` 的「三源运行期检查」8 项；真机看 manifest `runtime.abort_reason` |
+| 相机出帧检查（0.5 Hz） | `capture/collect_cap.py` + `camera_ffmpeg.py` | `RuntimeMonitor._check_frames()`、`progress_signal()`(:487) | `selftest` 首帧宽限 / 停滞 / 未配置三组 |
 | 回调线程入队 | `capture/collect_cap.py` | `snapshot_cap_frame()`(:316) | 只做拷贝，别在这里写盘 |
 | 批量落盘策略 | `capture/collect_cap.py` | `Hdf5Recorder.write_cap()`(:702)、`flush_cap()`(:724) / `_flush_cap_locked()`、`FLUSH_ROWS`(:160) | flush 时机影响中途读文件的结果 |
 | 终止时落盘 | 同上 | `emergency_save()`(:999)、`emergency_save_and_exit()`(:207) | `selftest` 的"收尾/紧急落盘"三项 |
@@ -31,7 +31,7 @@
 - `flush_cap` 先把这一批的数组全部构造完再统一 `resize`：中途抛异常时数据集都停在旧行数，
   不会出现"前 4 个数据集多 100 行、后 3 个没有"的错位
 | 相机完整的 ffmpeg 命令 | `capture/camera_ffmpeg.py` | `FfmpegCamera.command()`(:344) | V4L2 下跑一次 `--list-devices` |
-| 相机启动就绪检测 | `capture/camera_ffmpeg.py` | `CameraReadiness.poll()`(:683)、`progress_signal()`(:489) | 兼容 `frame` / `out_time_us` / `total_size` |
+| 相机出帧进度 | `capture/camera_ffmpeg.py` | `progress_signal()`(:487) | 兼容 `frame` / `out_time_us` / `total_size` |
 | 每帧时间戳回填 | `capture/camera_ffmpeg.py` | `probe()`(:607) → `probe_frames()`(:178) | 采集后看 `cameras/*/timestamp_unix_ns` 是否单调 |
 | 设备枚举 | `capture/camera_ffmpeg.py` | `discover_video_nodes()`(:74) | `--list-devices` |
 | Quest 连接与样本 | `capture/quest3.py` | `XrtReader.collect_sample()` | `selftest` 的 "Quest 采集" 组 |

@@ -167,7 +167,7 @@ codec、USB 口、机器都要重测。
 
 ### stream-copy 的 `.progress` 没有 `frame=`，被误判为 0 帧
 
-**现象**：MKV 已经在增长，但相机就绪检查一直显示 0 帧。
+**现象**：MKV 已经在增长，但相机出帧检查显示 0 帧（2026-11-23 前叫「就绪检查」）。
 
 **根因**：ffmpeg 7 的 stream-copy 可能只输出 `out_time_us` 和 `total_size`。
 只解析 `frame` 会误判。

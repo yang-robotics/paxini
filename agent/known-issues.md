@@ -60,5 +60,9 @@
   `usable = min(count, len(points), 119)` 回写），444 合计由 `selftest` 锁住。
 - `verify_rows` 只查 `cap/` 与 `quest/`，`cameras/` 刻意排除——它的两列等长由
   `write_camera_timestamps` 自己抛 `RuntimeError` 保证。
-- `resolve_delay` 用 cam0 的台账值给两路共用，是 2026-11-17 的明确决定，
-  不是漏了 cam1（cam1 缺测见 `待验证清单.md` A11）。
+- `resolve_delay` 用 cam0 的台账值给两路共用，是 2026-11-17 的明确决定。cam1 后来也单独
+  测过（2026-11-21，87.6 ms vs cam0 84.7 ms），差 2.9 ms 相对半帧可忽略，所以仍共用，
+  不是漏读（见 `待验证清单.md` A11）。
+- `XrtReader.call` 会吞掉 getter 异常并返回默认值，所以 PC Service 掉线时 `quest/` 全是
+  `-1` / NaN 而进程不报错。**这是刻意接受的**：单个可选接口缺失不该终止整场。失败痕迹
+  现在写进 `manifest.quest.errors`，事后能查；不做事后质量门控是 2026-11-23 的决定。

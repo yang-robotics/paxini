@@ -35,8 +35,9 @@ python3.10 capture/collect_cap.py --cap-side right --no-quest
 | 找不到串口 | `ls /dev/ttyACM*`；空就查线缆、供电与 `dialout` 组（改了组要重新登录） |
 | `import pxhandsdk` 成功但没 `PxCap3` | 用成 3.12 了，换 `python3.10` |
 | 相机 0 fps / 5 fps | 先 `--list-devices` 看节点，再查分辨率/帧率是否被设备支持；5 fps 多半是带宽或 Hub 问题 |
-| 相机 20 秒不出图 | 先 `--camera-mode cam0` 排除带宽；再验分辨率是否被支持 |
-| Quest 一直没 pose | 现在只打警告、不阻塞采集；没头显加 `--no-quest` 省掉 ADB 与轮询 |
+| 相机 20 秒不出图 | 先 `--camera-mode cam0` 排除带宽；再验分辨率是否被支持。宽限期后仍无帧会直接中止整场（`runtime.abort_reason`） |
+| Quest 装配失败（PC Service / ADB / SDK） | 直接判启动失败，不再降级。没头显就显式加 `--no-quest` |
+| Quest 有行但全是 -1/NaN | PC Service 中途掉线，getter 异常被吞：查 `manifest.quest.errors` |
 | 采完没有 `manifest.json` | 被强杀了。数据落在最后一个满批之前（每批已 flush），先 `--clear-write-flag` 再读；2026-11-13 那批老文件没这个保护，全废 |
 
 ## 3. 改 HDF5 字段

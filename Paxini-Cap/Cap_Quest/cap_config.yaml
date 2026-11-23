@@ -24,9 +24,8 @@ no_quest: false          # true = 只采手套与相机，quest 组写 NaN
 
 # ---------------------------------------------------------------- 体积与视图
 omit_distribution: false # true = 不写 10×119×3 分布力，体积降到几 MB/h
-view: false              # 采集时开实时视图（只读内存，不碰 data.h5）
+view: false              # 采集时开实时视图（只读内存，不碰 data.h5）；开了就带相机缩略图
 view_mode: auto          # auto / html / tk；无显示器时选 html
 view_fps: 20             # 只对 tk 模式生效，html 固定 150 ms 轮询
-view_video: true         # 视图里显示相机关键帧（走录制 ffmpeg 的第二路输出）
-view_video_fps: 5        # 预览抽帧帧率，调高会多占 ffmpeg 的 CPU
-view_video_width: 360    # 预览宽度，高度按比例
+view_video_fps: 5        # 相机缩略图抽帧帧率，调高会多占 ffmpeg 的 CPU
+view_video_width: 360    # 缩略图宽度，高度按比例

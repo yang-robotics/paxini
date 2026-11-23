@@ -51,10 +51,8 @@ from collect_cap import (
     CAP_SLOT_POINTS,
     CAP_SLOTS,
     STOP_EVENT,
-    CameraReadiness,
-    CaptureReadiness,
     Hdf5Recorder,
-    QuestReadiness,
+    RuntimeMonitor,
     TimedSample,
     TimedStream,
     apply_config,
@@ -476,6 +474,25 @@ def test_quest3_sample() -> None:
         "Quest 采集/SDK 不给时落 -1",
         int(quest_sample_to_row(empty, "head", "left")["quest/body_timestamp_ns"])
         == -1,
+    )
+
+    class BrokenXrt(FakeXrt):
+        def get_time_stamp_ns(self) -> int:
+            raise RuntimeError("PC Service 没了")
+
+    broken = object.__new__(XrtReader)
+    broken.xrt = BrokenXrt()
+    broken.errors = {}
+    sample = broken.collect_sample(11)
+    check(
+        "Quest 采集/getter 异常被吞并记进 errors（manifest 靠它溯源）",
+        "get_time_stamp_ns" in broken.errors
+        and sample.get("sdk_timestamp_ns") is None
+        and int(
+            quest_sample_to_row(sample, "head", "left")["quest/sdk_timestamp_ns"]
+        )
+        == -1,
+        f"{sorted(broken.errors)} {sample.get('sdk_timestamp_ns')!r}",
     )
 
 
@@ -973,7 +990,7 @@ def test_config_file(tmp_root: Path) -> None:
     view_parser = build_parser()
     apply_config(
         view_parser,
-        {"view": True, "view_fps": 15, "view_video": False},
+        {"view": True, "view_fps": 15, "view_video_fps": 8},
         path,
     )
     view_args = view_parser.parse_args([])
@@ -981,8 +998,8 @@ def test_config_file(tmp_root: Path) -> None:
         "配置/实时视图可默认打开",
         view_args.view is True
         and view_args.view_fps == 15.0
-        and view_args.view_video is False,
-        f"{view_args.view!r} {view_args.view_fps!r} {view_args.view_video!r}",
+        and view_args.view_video_fps == 8.0,
+        f"{view_args.view!r} {view_args.view_fps!r} {view_args.view_video_fps!r}",
     )
     check(
         "配置/实时视图命令行可关掉",
@@ -1763,7 +1780,7 @@ def run_case(name: str, function: Any, *args: Any) -> None:
 
 
 class _FakeCamera:
-    """只实现就绪检测用到的四个方法，不碰 ffmpeg。"""
+    """只实现运行期检查用到的三个方法，不碰 ffmpeg。"""
 
     def __init__(self, camera_id: str, progress: int = 0, failure: str | None = None) -> None:
         self.camera_id = camera_id
@@ -1783,86 +1800,108 @@ class _FakeCamera:
         self.stops += 1
 
 
-def _quest_sample(sequence: int) -> TimedSample:
-    pose = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-    return TimedSample(
-        data={
-            "sequence": sequence,
-            "tracked": True,
-            "head": {"pose_xyzw": pose, "tracked": True, "available": True},
-            "controllers": {},
-            "hands": {},
-        }
-    )
+class _FakePoller:
+    """只实现运行期检查用到的两个属性，不起线程。"""
+
+    def __init__(self, failure: Exception | None = None, samples: int = 0) -> None:
+        self.failure = failure
+        self.samples = samples
+        self.overruns = 0
 
 
-def test_source_readiness() -> None:
-    """就绪检测必须是非阻塞的，而且只能判死自己那一路。"""
-    good = _FakeCamera("cam0")
-    tracker = CameraReadiness([good], timeout_s=60.0, required_samples=3)
-    counts = []
-    for step in range(3):
-        good.progress += 1
-        counts.append(bool(tracker.poll()))
+def test_runtime_monitor() -> None:
+    """运行期检查：只查配置了的源，宽限期内不误报，失效就中止整场。"""
+    import collect_cap
+
+    def fresh(cameras, poller=None, grace: float = 0.0):
+        collect_cap.ABORT_REASON = None
+        STOP_EVENT.clear()
+        monitor = RuntimeMonitor(cameras, poller, camera_grace_s=grace)
+        monitor.note_cap()
+        monitor._next_process = 0.0
+        monitor._next_frames = 0.0
+        return monitor
+
+    monitor = fresh([_FakeCamera("cam0")], grace=60.0)
+    monitor.poll()
+    check("首帧宽限期内没有出帧不中止", collect_cap.ABORT_REASON is None)
+
+    monitor = fresh([_FakeCamera("cam0")], grace=0.0)
+    monitor.CAMERA_STALL_S = 0.0
+    monitor.poll()
     check(
-        "相机连续 N 帧进度才算就绪",
-        counts == [False, False, True] and tracker.pending == [],
-        f"{counts}",
+        "宽限过后一帧都没有也算停滞并中止",
+        "没有新帧" in (collect_cap.ABORT_REASON or "")
+        and "进度停在 0" in (collect_cap.ABORT_REASON or ""),
+        collect_cap.ABORT_REASON or "",
     )
 
-    dead = _FakeCamera("cam1")
-    tracker = CameraReadiness([dead], timeout_s=0.0, required_samples=3)
-    tracker.poll()
+    cam = _FakeCamera("cam0", progress=5)
+    monitor = fresh([cam], grace=0.0)
+    monitor.poll()
+    check("有帧时先记下首帧时刻", monitor.first_frame_s.get("cam0") is not None)
+    monitor.CAMERA_STALL_S = 0.0
+    monitor._next_frames = 0.0
+    monitor.poll()
     check(
-        "相机超时只判死这一路并给出原因",
-        "cam1" in tracker.failed and "超时" in tracker.failed["cam1"],
-        tracker.failed.get("cam1", "")[:40],
+        "出过帧后停滞即中止",
+        "没有新帧" in (collect_cap.ABORT_REASON or ""),
+        collect_cap.ABORT_REASON or "",
     )
 
-    sick = _FakeCamera("cam2", failure="ffmpeg 退出码 1")
-    tracker = CameraReadiness([sick], timeout_s=60.0, required_samples=3)
-    tracker.poll()
+    monitor = fresh([_FakeCamera("cam0", failure="ffmpeg 退出码 1")], grace=60.0)
+    monitor.poll()
     check(
-        "相机进程已死时立刻判死，不必等超时",
-        tracker.failed.get("cam2") == "ffmpeg 退出码 1",
-        tracker.failed.get("cam2", ""),
+        "相机进程退出即中止",
+        "ffmpeg 退出码 1" in (collect_cap.ABORT_REASON or ""),
+        collect_cap.ABORT_REASON or "",
     )
 
-    stream = TimedStream(max_samples=8)
-    quest = QuestReadiness(stream, "head", "right", timeout_s=60.0, required_samples=3)
-    results = []
+    monitor = fresh([], _FakePoller(failure=RuntimeError("boom")))
+    monitor.poll()
+    check(
+        "Quest 轮询异常即中止",
+        "Quest 轮询异常" in (collect_cap.ABORT_REASON or ""),
+        collect_cap.ABORT_REASON or "",
+    )
+
+    monitor = fresh([], _FakePoller(samples=10))
+    monitor.poll()
+    monitor.QUEST_POLL_STALL_S = 0.0
+    monitor._next_process = 0.0
+    monitor.poll()
+    check(
+        "Quest 轮询计数停滞即中止",
+        "没有返回样本" in (collect_cap.ABORT_REASON or ""),
+        collect_cap.ABORT_REASON or "",
+    )
+
+    monitor = fresh([], None)
+    monitor.GLOVE_STALL_S = 1e9
+    monitor.poll()
+    check("未配置的源不参与检查", collect_cap.ABORT_REASON is None)
+
+    monitor = fresh([], None)
+    monitor.GLOVE_STALL_S = 0.0
+    monitor.poll()
+    check(
+        "手套停滞即中止",
+        "手套" in (collect_cap.ABORT_REASON or ""),
+        collect_cap.ABORT_REASON or "",
+    )
+
+    stream = TimedStream(max_samples=2)
     for sequence in range(3):
-        stream.push(_quest_sample(sequence))
-        results.append(quest.poll())
+        stream.push(TimedSample(data={"sequence": sequence}))
+    kept = stream.drain()
     check(
-        "Quest 连续 N 帧有效 pose 才算就绪",
-        results == [False, False, True] and quest.ready_wait_s is not None,
-        f"{results}",
+        "Quest 缓冲满了丢最旧的样本并计数",
+        stream.dropped == 1 and [item.data["sequence"] for item in kept] == [1, 2],
+        f"dropped={stream.dropped} kept={[item.data['sequence'] for item in kept]}",
     )
 
-    empty = QuestReadiness(
-        TimedStream(max_samples=8), "head", "right", timeout_s=0.0, required_samples=3
-    )
-    empty.poll()
-    check("Quest 一直没样本时只记超时，不抛异常", empty.timed_out and not empty.ready)
-
-    dead_cam = _FakeCamera("cam9")
-    errors: dict[str, str] = {}
-    monitor = CaptureReadiness(
-        QuestReadiness(
-            TimedStream(max_samples=8), "head", "right", timeout_s=0.0, required_samples=3
-        ),
-        CameraReadiness([dead_cam], timeout_s=0.0, required_samples=3),
-        {"cam9": dead_cam},
-        errors,
-    )
-    monitor.poll()
-    monitor.poll()
-    check(
-        "一路失败只记错误并停掉它自己，不抛异常",
-        "cam9" in errors and dead_cam.stops == 1 and monitor.idle,
-        f"stops={dead_cam.stops} idle={monitor.idle}",
-    )
+    collect_cap.ABORT_REASON = None
+    STOP_EVENT.clear()
 
 
 def main() -> int:
@@ -1881,7 +1920,7 @@ def main() -> int:
         run_case("配置", test_config_file, tmp_root)
         run_case("手别选择", test_pose_side_selection, tmp_root)
         run_case("启动失败工件", test_startup_failure, tmp_root)
-        run_case("三源就绪检测", test_source_readiness)
+        run_case("三源运行期检查", test_runtime_monitor)
         if shutil.which("ffprobe"):
             run_case("相机命令", test_camera_command, tmp_root)
             run_case("相机预览", test_camera_preview, tmp_root)
