@@ -54,7 +54,7 @@
 | 改插值方式 | 同上 | `lerp_rows()`(:376) / `nearest_rows()`(:405) | 合成线性信号零误差（selftest 第 1 项） |
 | 改延迟补偿 | 同上 | `resolve_delay()`(:316) | `--no-delay` 与默认值对照，差值应等于 Δ；**默认 0 = 未标定** |
 | 改输出字段 | 同上 | `write_aligned()`(:951) | `selftest` 的"输出可重开"项 + 同步 `Paxini-Align/README.md` 字段表 |
-| 改质量判据 | 同上 | `gates()`(:1118)、`report()`(:1054) | `--strict` 跑一次真采集 |
+| 改质量判据 | 同上 | `gates()`(:1120)、`report()`(:1056) | 跑一次真采集；判据不过时不会产出文件，退出码 1 |
 | 改 Quest 对齐 | `Paxini-Align/align_capture.py` | `load_quest_clock_report()`(:88)、`align_quest_to_targets()`(:454)、`write_quest_alignment()`(:906) | `selftest.py` 的 Quest 因果选样、C8 硬门控、完整字段复制；同步 Align README |
 
 对齐层**只读** `data.h5`，绝不回写；改这里不会影响采集端，但改了输出布局要升

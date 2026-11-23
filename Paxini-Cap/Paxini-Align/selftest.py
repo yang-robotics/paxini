@@ -220,7 +220,7 @@ def make_clock_report(
 
 
 def run(rec: Path, **kwargs) -> dict:
-    defaults = dict(reference=None, timebase="auto", delay_ms=0.0, omit_distribution=False,
+    defaults = dict(reference=None, delay_ms=0.0, omit_distribution=False,
                     interpolate_distribution=True, keep_outside=False)
     defaults.update(kwargs)
     return ac.align_recording(rec, **defaults)
@@ -396,15 +396,22 @@ def test_omit_distribution(tmp: Path) -> None:
           ac.DISTRIBUTION_STATE not in result["state"], result["distribution"])
 
 
-def test_timebase_fallback(tmp: Path) -> None:
-    rec = make_recording(tmp)
+def test_timebase_selection(tmp: Path) -> None:
+    """时间基自动判定，没有 CLI 开关。
+
+    真实采集里相机永远没有 timestamp_monotonic_ns（V4L2 路径只记墙钟），所以
+    正常输入必须落到 unix。第一条用合成数据造出「三路都有单调钟」的理想文件，
+    只为固定住那个分支的行为，不代表真机会走到。
+    """
+    rec = make_recording(tmp, with_mono=False)
     with h5py.File(rec / "data.h5") as f:
-        tb = ac.choose_timebase(f, "auto")
-    rec2 = make_recording(tmp / "second", with_mono=False)
-    with h5py.File(rec2 / "data.h5") as f:
-        tb2 = ac.choose_timebase(f, "auto")
-    check("timebase auto：有单调钟选 mono，没有退回 unix", tb == "mono" and tb2 == "unix",
-          f"{tb} / {tb2}")
+        tb = ac.choose_timebase(f)
+    check("相机无单调钟列 → unix（真机口径）", tb == "unix", tb)
+
+    ideal = make_recording(tmp / "ideal", with_mono=True)
+    with h5py.File(ideal / "data.h5") as f:
+        tb2 = ac.choose_timebase(f)
+    check("三路都有单调钟 → mono（真机不会出现）", tb2 == "mono", tb2)
 
 
 def test_multi_camera_views(tmp: Path) -> None:
@@ -412,9 +419,12 @@ def test_multi_camera_views(tmp: Path) -> None:
     result = run(rec)
     views = result["views"]
     ok = set(views) == {"right_cam0", "right_cam1"}
-    dt = np.abs(views["right_cam1"]["dt_ms"]) if ok else np.array([999.0])
-    check("两路相机各自给出最近帧号（cam1 误差 ≤ 半帧）",
-          ok and float(dt.max()) <= 16.7 + 0.1, f"cam1 最大偏差 {float(dt.max()):.2f} ms")
+    dt = np.asarray(views["right_cam1"]["dt_ms"], dtype=np.float64) if ok else np.array([999.0])
+    # 因果取帧：dt_ms 是「该帧时刻 − 主轴时刻」，所以必须 <= 0（不晚于目标），
+    # 且滞后不超过一个帧间隔。
+    check("cam1 取每行之前最近的一帧（0 >= dt_ms >= -一帧）",
+          ok and float(dt.max()) <= 1e-3 and float(dt.min()) >= -33.4,
+          f"dt_ms 范围 {float(dt.min()):.2f} ~ {float(dt.max()):.2f}")
 
 
 def test_quest_causal_pairing(tmp: Path) -> None:
@@ -604,7 +614,7 @@ def test_quest_coverage_gate(tmp: Path) -> None:
     problems = ac.gates(result)
     fraction = float(result["quest"]["valid_fraction"])
     check(
-        "Quest 有效配对不足 95% 时进入 strict 失败判据",
+        "Quest 有效配对不足 95% 时进入质量判据",
         any("Quest 有效配对" in item for item in problems),
         f"有效 {fraction:.1%}",
     )
@@ -637,7 +647,6 @@ def test_quest_cli_roundtrip(tmp: Path) -> None:
             "sdk_unix",
             "--quest-clock-report",
             str(rec / "clock_report.json"),
-            "--strict",
         ]
     )
     path = out / "aligned_right_cam0.h5"
@@ -695,6 +704,23 @@ def test_gates_pass(tmp: Path) -> None:
     result = run(rec)
     problems = ac.gates(result)
     check("质量判据对合成数据全过", not problems, "；".join(problems) or "无问题")
+
+
+def test_quality_gate_blocks_write(tmp: Path) -> None:
+    """质量判据不过时不写产物、退出码非 0。
+
+    这是删掉 --strict 之后的唯一口径：判据在写文件之前跑，不合格就没有文件，
+    不需要任何开关来表达「请认真检查」。
+    """
+    rec = make_recording(tmp, glove_seconds=0.5, cam_seconds=1.0, cam_offset_s=0.0)
+    out = tmp / "blocked"
+    code = ac.main([str(rec), "--output", str(out), "--delay-ms", "0"])
+    path = out / "aligned_right_cam0.h5"
+    check(
+        "质量判据不过时不写文件且退出码非 0",
+        code == 1 and not path.is_file(),
+        f"exit={code} 写成文件={path.is_file()}",
+    )
 
 
 def test_rejects_unsorted(tmp: Path) -> None:
@@ -769,8 +795,8 @@ def main() -> int:
             test_window_camera_boundary_uses_delay, test_windows_in_summary,
             test_windows_no_overlap,
             test_nearest_integer, test_counts_nearest, test_omit_distribution,
-            test_timebase_fallback, test_multi_camera_views, test_write_and_reopen,
-            test_gates_pass, test_rejects_unsorted, test_write_flag_repair, test_lookup3_vector,
+            test_timebase_selection, test_multi_camera_views, test_write_and_reopen,
+            test_gates_pass, test_quality_gate_blocks_write, test_rejects_unsorted, test_write_flag_repair, test_lookup3_vector,
             test_quest_causal_pairing, test_quest_duplicate_tie_break,
             test_quest_clock_model_inverse,
             test_quest_missing_semantics, test_quest_full_group_written,

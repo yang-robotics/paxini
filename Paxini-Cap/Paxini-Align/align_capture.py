@@ -285,15 +285,20 @@ def has_mono(group: Any) -> bool:
     return "timestamp_monotonic_ns" in group
 
 
-def choose_timebase(handle: Any, requested: str) -> str:
-    """Pick the clock used to pair sources.
+def choose_timebase(handle: Any) -> str:
+    """Pick the clock used to pair sources. No CLI override.
 
-    Monotonic is preferred: glove and camera monotonic share one domain and are
-    immune to NTP steps (see DOC/时间戳说明.md). The linux camera backend has no
-    monotonic column, so fall back to wall clock there.
+    Monotonic is only usable when *every* source that defines the grid carries
+    it: the grid is a subtraction between the reference camera and the glove, so
+    one side in a different clock domain is meaningless.
+
+    In practice this always returns ``"unix"``: the V4L2 backend leaves
+    ``timestamp_monotonic_ns`` absent by design (``write_camera_timestamps`` is
+    called with ``monotonic_ns=None``), so the camera is wall-clock only. The
+    ``mono`` branch is kept so that a future backend that reads V4L2 buffer
+    timestamps starts working without touching this file. There is deliberately
+    no ``--timebase`` flag: it used to offer ``mono``, which could never succeed.
     """
-    if requested in ("mono", "unix"):
-        return requested
     slots = camera_slots(handle)
     if has_mono(handle["cap"]) and slots and all(has_mono(handle["cameras"][s]) for s in slots):
         return "mono"
@@ -332,7 +337,7 @@ def resolve_delay(explicit: float | None, disabled: bool) -> tuple[float, str]:
         entry = pick_latest(load_records(), camera=0)
         if entry:
             return float(entry["median_ms"]), (
-                f"latency/records 台账 cam0 @{entry.get('at', '')}，两路共用同一值（cam1 未单独测）"
+                f"latency/records 台账 cam0 @{entry.get('at', '')}，两路共用同一值（cam1 实测 87.6 ms，未逐路补偿）"
             )
         detail = "台账里没有 cam0 的合格记录"
     except Exception as exc:  # missing PyYAML, missing file, whatever
@@ -566,7 +571,6 @@ def quest_valid_window(
 def align_recording(
     recording: Path,
     reference: str | None,
-    timebase: str,
     delay_ms: float,
     omit_distribution: bool,
     interpolate_distribution: bool,
@@ -596,7 +600,7 @@ def align_recording(
         if not slots:
             raise AlignError("data.h5 里没有 cameras/ 组：这份采集没录视频，无法确定采样网格")
 
-        tb = choose_timebase(handle, timebase)
+        tb = choose_timebase(handle)
         key = "timestamp_monotonic_ns" if tb == "mono" else "timestamp_unix_ns"
 
         glove_t = np.asarray(handle["cap"][key][:], dtype=np.int64)
@@ -767,11 +771,12 @@ def align_recording(
                     "timestamp_ns": ref_raw,
                 }
                 continue
-            pos = np.searchsorted(series, master_t)
-            lo = np.clip(pos - 1, 0, series.size - 1)
-            hi = np.clip(pos, 0, series.size - 1)
-            pick_hi = np.abs(series[hi] - master_t) < np.abs(master_t - series[lo])
-            idx = np.where(pick_hi, hi, lo)
+            # 因果取帧：每行用「不晚于主轴时刻的最后一帧」，绝不用这一路
+            # 目标时刻之后的画面。dt_ms 因此恒 <= 0，唯一例外是主轴早于该路
+            # 首帧（窗口边界含 Δ 的边界情况），那时被迫取首帧、dt_ms > 0。
+            # 远视角训练若改用未来帧，等于让模型看到还没发生的画面。
+            pos = np.searchsorted(series, master_t, side="right") - 1
+            idx = np.clip(pos, 0, series.size - 1)
             views[slot] = {
                 "frame_index": idx.astype(np.int32),
                 "dt_ms": ((series[idx] - master_t) / 1e6).astype(np.float32),
@@ -1057,7 +1062,8 @@ def report(result: dict[str, Any], path: Path | None, delay_source: str) -> None
     log("")
     log(f"采集目录：{result['recording'].name}")
     log(f"  时间基：{result['timebase']}"
-        + ("（单调钟，免疫 NTP）" if result["timebase"] == "mono" else "（墙钟，已查跳变）"))
+        + ("（单调钟，免疫 NTP）" if result["timebase"] == "mono"
+           else "（墙钟；相机无单调钟列，这是当前唯一可用的一路时钟）"))
     log(f"  延迟补偿：-{result['delay_ms']:.1f} ms，来源 {delay_source}")
     log(f"  手套 {result['glove_rows']} 帧 → 相机 {result['camera_rows']} 帧 → 对齐 {result['aligned_rows']} 行")
     if result["dropped_outside"]:
@@ -1078,7 +1084,10 @@ def report(result: dict[str, Any], path: Path | None, delay_source: str) -> None
     log(f"  真插值 {summary['interpolated_rows']} 行（{ratio * 100:.1f}%），其余正好落在手套帧上")
     log(f"  相机空洞 {result['holes']} 处（>{HOLE_FACTOR}× 中位间隔）")
     if result["timebase"] == "unix" and result["clock_jumps"]:
-        warn(f"手套墙钟出现 {result['clock_jumps']} 次跳变，跨跳变处插值不可信，建议 --timebase mono")
+        warn(
+            f"手套墙钟出现 {result['clock_jumps']} 次跳变，跨跳变处插值不可信："
+            "这份采集的时间轴在跳变点前后不可比，建议整段重采"
+        )
     log("  分布力：已插值" if result["distribution"] == "interpolated"
         else f"  分布力：{result['distribution']}")
     quest = result.get("quest")
@@ -1163,8 +1172,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("path", nargs="?", default=".", help="采集目录，或 Recordings 根目录（批量；标准位置是 ../Recordings）")
     parser.add_argument("--output", default=None, help="输出目录，默认 <采集目录>/aligned")
     parser.add_argument("--reference", default=None, help="作为采样网格的相机槽位，默认第一个（通常是 cam0）")
-    parser.add_argument("--timebase", choices=("auto", "mono", "unix"), default="auto",
-                        help="auto 优先单调钟；文件里没有 timestamp_monotonic_ns（旧文件）时自动退回墙钟")
     parser.add_argument("--delay-ms", type=float, default=None,
                         help=f"相机延迟补偿（毫秒），默认读台账，读不到用 {DEFAULT_DELAY_MS}")
     parser.add_argument("--no-delay", action="store_true", help="不减延迟（调试用，正式数据别用）")
@@ -1174,7 +1181,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-outside", action="store_true",
                         help="保留落在手套覆盖范围外的相机帧（默认丢弃）")
     parser.add_argument("--dry-run", action="store_true", help="只统计，不写文件")
-    parser.add_argument("--strict", action="store_true", help="质量判据不过就以非 0 退出")
     parser.add_argument("--clear-write-flag", action="store_true",
                         help="采集被强杀导致 data.h5 打不开时，清掉超级块里的写标志（等价 h5clear -s）")
     parser.add_argument(
@@ -1201,7 +1207,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_QUEST_MIN_VALID_FRACTION,
         help=(
             "Quest 有效配对比例门槛，默认 "
-            f"{DEFAULT_QUEST_MIN_VALID_FRACTION:g}；--strict 时未达标即失败"
+            f"{DEFAULT_QUEST_MIN_VALID_FRACTION:g}；未达标即不写输出文件"
         ),
     )
     return parser
@@ -1247,7 +1253,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = align_recording(
                 recording=recording,
                 reference=args.reference,
-                timebase=args.timebase,
                 delay_ms=delay_ms,
                 omit_distribution=args.omit_distribution,
                 interpolate_distribution=not args.nearest_distribution,
@@ -1262,14 +1267,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Δ 的来源要进产物，否则三个月后没人知道这份 aligned 是拿什么数
             # 修的时间轴（0 = 未标定）。
             result["delay_source"] = delay_source
+            # 质量判据排在写文件之前：不合格就不落盘。产物一旦存在就会被
+            # 训练侧的 glob 捡走，日志里的 warn 拦不住任何东西。
+            problems = gates(result)
+            rejected = bool(problems)
+            if rejected:
+                failures += 1
+                for problem in problems:
+                    error(f"{recording.name}: {problem}")
+                error(
+                    f"{recording.name}: 质量判据未通过，不写输出文件"
+                    "（要产出先修数据；--dry-run 与这里一样只看统计）"
+                )
+            else:
+                log("  自检：主时间轴严格递增、关节角无 NaN、counts 合计 444 —— 通过")
             out_dir = (
                 Path(args.output).expanduser().resolve()
                 if args.output
                 else recording / "aligned"
             )
             path = None
-            if not args.dry_run:
+            if not args.dry_run and not rejected:
                 path = write_aligned(result, out_dir)
+            # 不合格也照常打印统计：否则你看不到是跨度超标还是行数不够。
             report(result, path, delay_source)
         except AlignError as exc:
             error(f"{recording.name}: {exc}")
@@ -1278,19 +1298,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 hard_quest_failures += 1
             continue
 
-        problems = gates(result)
-        if problems:
-            failures += 1
-            for problem in problems:
-                warn(f"{recording.name}: {problem}")
-        else:
-            log("  自检：主时间轴严格递增、关节角无 NaN、counts 合计 444 —— 通过")
-
     if hard_quest_failures:
         error(f"{hard_quest_failures} 个采集目录未通过 Quest C8 硬门控")
         return 1
-    if failures and args.strict:
-        error(f"{failures} 个采集目录未通过")
+    if failures:
+        error(f"{failures} 个采集目录未通过质量判据")
         return 1
     return 0
 
