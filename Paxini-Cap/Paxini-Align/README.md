@@ -137,6 +137,11 @@ python3.10 align_capture.py <采集目录> \
 | 重复时间戳 | 取源文件里**最后一条** | `searchsorted(side="right")-1` 天然如此 |
 | 滞后 | 逐行记 `quest/age_ms` | 前驱的代价是 0~一个采样间隔的滞后，如实记录，下游按需过滤 |
 
+**「有时间戳」不等于「有姿态」。** PC Service 掉线后 getter 会返回默认值，`sdk_timestamp_ns`
+可能还在走而 `pose_6d` 已经整段是 NaN。这类行**不进候选集**：前驱会跳到更早的有效样本，
+若那段太长就会被 `--quest-max-age-ms` 判成 `valid=false`；整列都坏时直接报错，不会产出一份
+`valid` 全 true、姿态全 NaN 的文件。剔除行数记在 `result.pose_excluded_rows` 并打警告。
+
 这和图像的处理保持一致：**相机和 Quest 都只取目标时刻之前的样本，永不使用未来帧。**
 
 `--quest-max-age-ms` 默认 `25`：左邻距目标超过这个值就判该行无效（Quest 中间断档时，
@@ -173,6 +178,7 @@ python3.10 align_capture.py <采集目录> \
 | `glove/span_ms` | (K,) | float64 | 两帧间距；**这是插值可信度的唯一指标** |
 | `glove/offset_ms` | (K,) | float64 | 距左邻帧多少毫秒 |
 | `glove/interpolated` | (K,) | bool | 是否真的插值（正好落在手套帧上时为 False） |
+| `glove/extrapolated` | (K,) | bool | 正交于上一条：该行落在手套覆盖范围外，数值是边界帧的克隆。**只有 `--keep-outside` 时存在这一列** |
 | `glove/clock_offset_ns` | (K,) | int64 | 该行左邻手套帧的**墙钟 − 单调钟**。正常是常数；出现台阶就是采集中途被 NTP 校过时，台阶之后的行不可与之前混比 |
 | `state/joint_angles_deg` | (K,4) | float64 | 4 路关节角，**线性插值** |
 | `state/encoder_raw` | (K,4) | int32 | 4 路编码器，**最近邻**（计数器不是信号，不能平均） |
@@ -183,7 +189,7 @@ python3.10 align_capture.py <采集目录> \
 | `cameras/<id>/dt_ms` | (K,) | float32 | 该帧时刻 − 主轴时刻，**恒 ≤ 0**（因果取帧，不会用未来的画面）；唯一例外是主轴早于该路首帧的边界行 |
 | `cameras/<id>/timestamp_ns` | (K,) | int64 | 该帧的真实时刻 |
 | `quest/index` | (K,) | int64 | 所选源行号；无配对时为 `-1` |
-| `quest/valid` | (K,) | bool | 是否存在年龄 ≤ `--quest-max-age-ms` 的左邻样本 |
+| `quest/valid` | (K,) | bool | 是否存在年龄 ≤ `--quest-max-age-ms`、且姿态有限的左邻样本 |
 | `quest/age_ms` | (K,) | float64 | 目标时刻减所选样本的主机 Unix 时刻，即这一行的滞后；无候选时为 NaN。**下游过滤“太旧”的行就看它** |
 | `quest/timestamp_sdk_ns` | (K,) | int64 | 所选样本的原始 SDK 时间戳；无配对时为 `-1` |
 | `quest/timestamp_host_unix_ns` | (K,) | int64 | C8 模型换算后的主机 Unix 时刻；无配对时为 `-1` |
