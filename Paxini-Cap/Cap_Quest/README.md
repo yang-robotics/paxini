@@ -244,7 +244,7 @@ HDF5 只存索引性质的时间戳。
 | `duration_s` / `sample_span_s` | 墙钟耗时 / 手套首末帧跨度 |
 | `alignment` | 固定 `none (raw per-source timestamps only)` |
 | `hand` | 手别 `side`、Quest 请求手别 `pose_side_requested`、串口、SN、SDK/固件版本、故障、回调耗时、队列溢出、**首末帧时刻** `first/last_timestamp_unix_ns` 与 `first/last_timestamp_monotonic_ns` |
-| `quest` | enabled、rows、samples_dropped、轮询次数与超时（`poller_overruns`）、`poller_alive`、setup_error、**`errors`**（被 `XrtReader.call` 吞掉的 getter 异常，按接口名各记一条）、**首末 SDK 时间戳** `first/last_sdk_timestamp_ns`（域未验证，只作增量参考） |
+| `quest` | enabled、rows、samples_dropped、轮询次数与超时（`poller_overruns`）、`poller_alive`、**`errors`**（被 `XrtReader.call` 吞掉的 getter 异常，按接口名各记一条）、**首末 SDK 时间戳** `first/last_sdk_timestamp_ns`（域未验证，只作增量参考） |
 | `cameras` | 每路设备、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s`；汇总 `first_frame_s` |
 | `runtime` | `abort_reason`（中止原因，正常结束为 null）、`configured_sources`、出帧检查频率与两个停滞阈值、`camera_stalls` / `glove_stalls` |
 | `verify` | 行数自检（`row_mismatch` 必须为空） |

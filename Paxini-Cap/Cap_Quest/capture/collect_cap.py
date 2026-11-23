@@ -2139,7 +2139,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     reader: XrtReader | None = None
     poller: QuestPoller | None = None
     quest_setup: Any = None
-    quest_setup_error: str | None = None
     cameras: list[FfmpegCamera] = []
     started_cameras: list[FfmpegCamera] = []
     camera_devices: dict[str, str] = {}
@@ -2197,10 +2196,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 poller_started = True
                 log(
                     f"[INFO] Quest 轮询已启动：{args.quest_rate:g} Hz；"
-                    "运行期只查轮询线程存活，不等待有效 pose"
+                    "运行期只查采样计数是否还在增长，不等待有效 pose"
                 )
             except (QuestSetupError, RuntimeError, OSError, ImportError) as exc:
-                quest_setup_error = str(exc)
                 # 只清掉没起来的 poller；已经在跑的线程要留给 finally 收，
                 # 否则它会一直持有 SDK 调用。
                 if not poller_started:
@@ -2599,7 +2597,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 },
                 "quest": {
                     "enabled": not args.no_quest and poller is not None,
-                    "setup_error": quest_setup_error,
                     "timestamp_source": "sdk_provided",
                     # Per-getter failures are swallowed by XrtReader.call (an
                     # optional API missing must not kill the run), so they are
