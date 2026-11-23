@@ -532,24 +532,28 @@ def test_quest_unix_mode_takes_previous_row(tmp: Path) -> None:
     )
 
 
-def test_quest_unix_mode_tolerates_low_quality(tmp: Path) -> None:
-    """unix 模式下时间戳重复/覆盖率低只警告；sdk_unix 才硬失败。"""
+def test_quest_unix_mode_ignores_source_coverage(tmp: Path) -> None:
+    """unix 模式不看源文件覆盖率：坏行自动落 valid=false，不打扰也不作废。"""
     rec = make_recording(tmp)
     add_quest(rec, start_s=0.025)
     with h5py.File(rec / "data.h5", "r+") as f:
         sdk = f["quest/sdk_timestamp_ns"][:].astype(np.int64)
-        sdk[-max(10, sdk.size // 5):] = 0          # 20% 无效，低于 95%
+        # 中间挖掉 0.4 s：那一段的相机行左邻必然超龄（> 25 ms），落 valid=false。
+        # 只挖尾部没用——相机行结束得比 Quest 早，尾部缺失不会被任何行看到。
+        hole = sdk.size // 3
+        sdk[hole: hole + int(0.4 * 120)] = 0
         f["quest/sdk_timestamp_ns"][:] = sdk
     try:
         result = run(rec, quest_alignment=ac.QUEST_ALIGNMENT_UNIX)
     except ac.AlignError as exc:  # pragma: no cover - 回归保护
-        check("unix 模式对低质量时间戳只警告", False, str(exc)[:60])
+        check("unix 模式不因源覆盖率报警", False, str(exc)[:60])
         return
-    warnings = result["quest"]["quality_warnings"]
+    quest = result["quest"]
     check(
-        "unix 模式对低质量时间戳只警告",
-        any("比例" in item for item in warnings) and result["quest"]["valid_fraction"] > 0,
-        "；".join(warnings)[:60],
+        "unix 模式不因源覆盖率报警，坏行只体现为 valid=false",
+        not any("比例" in item for item in quest["quality_warnings"])
+        and quest["paired_rows"] < result["aligned_rows"],
+        f"警告={quest['quality_warnings']} 配对={quest['paired_rows']}/{result['aligned_rows']}",
     )
 
 
@@ -889,7 +893,7 @@ def main() -> int:
             test_gates_pass, test_clock_offset_column, test_quality_gate_blocks_write, test_rejects_unsorted, test_write_flag_repair, test_lookup3_vector,
             test_quest_causal_pairing, test_quest_duplicate_tie_break,
             test_quest_unix_mode_takes_previous_row,
-            test_quest_unix_mode_tolerates_low_quality,
+            test_quest_unix_mode_ignores_source_coverage,
             test_quest_clock_model_inverse,
             test_quest_missing_semantics, test_quest_full_group_written,
             test_quest_file_quality_gate, test_quest_coverage_gate,

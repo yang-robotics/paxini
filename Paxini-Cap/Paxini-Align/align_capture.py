@@ -167,7 +167,7 @@ def quest_timestamp_quality(raw_ns: np.ndarray) -> dict[str, Any]:
     return {
         "rows": int(raw.size),
         "valid_count": valid_count,
-        "valid_fraction": valid_count / raw.size if raw.size else 0.0,
+        "valid_source_fraction": valid_count / raw.size if raw.size else 0.0,
         "unique_count": int(np.unique(valid).size),
         "backwards_steps": (
             int(np.count_nonzero(np.diff(valid) < 0))
@@ -514,12 +514,16 @@ def align_quest_to_targets(
         # 拉取模型下重复是常态。sdk_unix 有 C8 报告背书，超限即判失败；
         # unix 模式只提示——重复不破坏「同一条时间轴」这个前提。
         (failures if mode == QUEST_ALIGNMENT_SDK_UNIX else warnings).append(repeated)
-    low_fraction = (
-        f"有效时间戳比例 {quality['valid_fraction']:.3f} 低于 {min_valid_fraction:.3f}"
-    )
-    if quality["valid_fraction"] < min_valid_fraction:
-        (failures if mode == QUEST_ALIGNMENT_SDK_UNIX else warnings).append(
-            low_fraction
+    # 源文件里「时间戳非 -1 的行占比」只对 sdk_unix 有意义：那条路要求整份文件的
+    # 时间戳质量达到 C8 报告阈值。unix 模式不做这个判断——配对时逐行跳过无效行，
+    # 缺的那部分自然表现为 quest/valid=false，再报一个比例纯属噪音。
+    if (
+        mode == QUEST_ALIGNMENT_SDK_UNIX
+        and quality["valid_source_fraction"] < min_valid_fraction
+    ):
+        failures.append(
+            f"有效时间戳比例 {quality['valid_source_fraction']:.3f} "
+            f"低于 {min_valid_fraction:.3f}"
         )
     if failures:
         raise AlignError("当前 data.h5 不满足 Quest 对齐条件：" + "；".join(failures))
@@ -1134,8 +1138,9 @@ def aligned_summary(result: dict[str, Any]) -> dict[str, Any]:
             "source_rows": quest["source_rows"],
             "paired_rows": quest["paired_rows"],
             "invalid_rows": int(result["aligned_rows"] - quest["paired_rows"]),
-            "valid_fraction": round(float(quest["valid_fraction"]), 6),
-            "minimum_valid_fraction": result["quest_min_valid_fraction"],
+            # paired_fraction = 多少相机行找到了样本（真正的「覆盖率」）
+            "paired_fraction": round(float(quest["valid_fraction"]), 6),
+            "minimum_paired_fraction": result["quest_min_valid_fraction"],
             "max_age_ms": quest["max_age_ms"],
             "age_ms": {
                 key: (
