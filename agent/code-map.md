@@ -37,7 +37,7 @@
 | Quest 连接与样本 | `capture/quest3.py` | `XrtReader.collect_sample()` | `selftest` 的 "Quest 采集" 组 |
 | Quest C8 时钟探针 | `diagnostics/quest_clock_probe.py` | `run_probe()`(:286)、`evaluate_clock_samples()`(:130) | `selftest` 的 "C8 探针" 组；产物落 `clock_probe/` |
 | 回放窗口 | `viewer/visualize.py` | `collect_payload()`(:380) → `run_window()`(:549) / `write_viewer()`(:966) | `--save-png` 出一张 |
-| Quest 回放 payload | `viewer/quest_view.py` | `load_quest_view()`(:161)、`load_clock_report()`(:115)、`take_evenly()`(:26) | `selftest` 的 "Quest 可视化"；默认独立轴，C8 通过才可 `sdk_unix` |
+| Quest 回放 payload | `viewer/quest_view.py` | `load_quest_view()`(:161)、`load_clock_report()`(:115)、`take_evenly()`(:26) | `selftest` 的 "Quest 可视化"；默认按 Unix 轴对齐，`none` 才独立轴 |
 | 回放视频预览 | `viewer/visualize.py` | `build_preview()`(:302) | `selftest` 的 "视频" 组 |
 | 分布力空间散点图 | `viewer/visualize.py` + `viewer/sensor_layout_schematic.py` | `build_slot_force()` 的 `dist`、`drawDistribution()`；无本地 Studio 模型时用示意网格，切向箭头用 `dist.tangent` | `selftest` 的 "可视化分布力" / "示意布局" 组 |
 | 实时视图 | `viewer/live_view.py` | `HtmlLiveView`(:773) / `LiveView`(:920) | `--view` 起一次 |

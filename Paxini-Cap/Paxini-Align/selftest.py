@@ -516,9 +516,9 @@ def test_quest_unix_mode_takes_previous_row(tmp: Path) -> None:
     check(
         "unix 模式免 C8 报告，Quest 整行取前驱",
         quest["mode"] == ac.QUEST_ALIGNMENT_UNIX
-        and quest["valid_fraction"] > 0.9
+        and quest["paired_fraction"] > 0.9
         and float(np.abs(pose[:, 0] - expected_from_row).max()) < 1e-12,
-        f"mode={quest['mode']} 有效={quest['valid_fraction']:.3f} "
+        f"mode={quest['mode']} 有效={quest['paired_fraction']:.3f} "
         f"偏差={float(np.abs(pose[:, 0] - expected_from_row).max()):.2e}",
     )
     # 前驱的代价是滞后，但必须被限制在一个采样间隔内并如实记录。
@@ -676,7 +676,7 @@ def test_quest_coverage_gate(tmp: Path) -> None:
         quest_report_sha256=digest,
     )
     problems = ac.gates(result)
-    fraction = float(result["quest"]["valid_fraction"])
+    fraction = float(result["quest"]["paired_fraction"])
     check(
         "Quest 有效配对不足 95% 时进入质量判据",
         any("Quest 有效配对" in item for item in problems),

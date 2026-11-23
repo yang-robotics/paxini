@@ -82,6 +82,7 @@ except ImportError:
 
     DIST_LAYOUT_SOURCE = "schematic"
 from quest_view import (
+    QUEST_ALIGNMENT_ACTIVE,
     QUEST_ALIGNMENT_CHOICES,
     QUEST_ALIGNMENT_NOTE,
     QUEST_ALIGNMENT_SDK_UNIX,
@@ -560,7 +561,7 @@ def collect_payload(
             )
             if (
                 quest_payload is not None
-                and quest_payload["alignment"] != QUEST_ALIGNMENT_SDK_UNIX
+                and quest_payload["alignment"] not in QUEST_ALIGNMENT_ACTIVE
             ):
                 warnings.append(QUEST_ALIGNMENT_NOTE)
         quest_rows = int(manifest.get("quest_rows") or 0)
@@ -837,8 +838,9 @@ def run_window(payload: dict[str, Any], root: Path,
                               color="#8792a6", transform=ax_text.transAxes)
     quest = payload.get("quest")
     quest_aligned = (
-        bool(quest) and quest.get("alignment") == QUEST_ALIGNMENT_SDK_UNIX
+        bool(quest) and quest.get("alignment") in QUEST_ALIGNMENT_ACTIVE
     )
+    quest_verified = bool(quest) and quest.get("alignment") == QUEST_ALIGNMENT_SDK_UNIX
     quest_valid_times: np.ndarray | None = None
     quest_valid_rows: np.ndarray | None = None
     if quest_aligned and quest:
@@ -860,6 +862,8 @@ def run_window(payload: dict[str, Any], root: Path,
         (
             (
                 "Quest：已按 C8 验证的 Unix 时钟对齐"
+                if quest_verified
+                else "Quest：已按 Unix 墙钟对齐（未经 C8 验证）"
                 if quest_aligned
                 else "Quest：独立 SDK 时间轴，未做跨源时间对齐"
             )
@@ -2542,12 +2546,13 @@ function buildQuest() {
     return;
   }
   card.style.display = 'flex';
-  const aligned = QUEST.alignment === 'sdk_unix';
+  const aligned = QUEST.alignment !== 'none';
+  const verified = QUEST.alignment === 'sdk_unix';
   const sideLabel = QUEST.pose_side === 'right' ? '右手柄' : '左手柄';
   el('questMeta').textContent =
     QUEST.rows + ' 行 · ' + QUEST.shown + ' 点 · ' +
-    (aligned ? 'Unix 对齐' : QUEST.time_source === 'sdk_timestamp_ns'
-      ? '归一化进度' : '轮询序号');
+    (aligned ? (verified ? 'Unix 对齐 (C8)' : 'Unix 对齐') 
+      : QUEST.time_source === 'sdk_timestamp_ns' ? '归一化进度' : '轮询序号');
   el('questAlignNote').classList.toggle('aligned', aligned);
   el('questAlignNote').textContent = QUEST.alignment_note;
   el('questPosTitle').textContent = sideLabel + '位置 XYZ · m';
@@ -2921,9 +2926,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quest-align",
         choices=QUEST_ALIGNMENT_CHOICES,
-        default="none",
+        default="unix",
         help=(
-            "none=Quest 独立时间轴；sdk_unix=仅在 C8 报告通过时对齐到手套 Unix 轴"
+            "unix=SDK 戳就是主机墙钟，直接对齐到手套 Unix 轴（默认）；"
+            "sdk_unix=先经 C8 报告的时钟模型换算；none=独立时间轴"
         ),
     )
     parser.add_argument(
@@ -2978,9 +2984,21 @@ def main(argv: list[str] | None = None) -> int:
     if not root.is_dir():
         print(f"[错误] 目录不存在：{root}", file=sys.stderr)
         return 2
-    if args.no_quest and args.quest_align == QUEST_ALIGNMENT_SDK_UNIX:
-        print("[错误] --no-quest 与 --quest-align sdk_unix 不能同时使用", file=sys.stderr)
+    if args.no_quest and args.quest_align in QUEST_ALIGNMENT_ACTIVE:
+        print(
+            "[错误] --no-quest 与 --quest-align unix/sdk_unix 不能同时使用",
+            file=sys.stderr,
+        )
         return 2
+    if (
+        args.quest_clock_report is not None
+        and args.quest_align != QUEST_ALIGNMENT_SDK_UNIX
+    ):
+        print(
+            "[警告] 给了 --quest-clock-report 但 --quest-align 不是 sdk_unix，"
+            "报告不会被使用",
+            file=sys.stderr,
+        )
     clock_report = None
     if args.quest_align == QUEST_ALIGNMENT_SDK_UNIX:
         if args.quest_clock_report is None:

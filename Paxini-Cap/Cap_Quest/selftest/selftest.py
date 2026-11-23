@@ -68,8 +68,10 @@ from quest3 import XrtReader
 from quest_clock_probe import evaluate_clock_samples
 from quest_view import (
     QUEST_ALIGNED_NOTE,
+    QUEST_ALIGNED_VERIFIED_NOTE,
     QUEST_ALIGNMENT_NOTE,
     QUEST_ALIGNMENT_SDK_UNIX,
+    QUEST_ALIGNMENT_UNIX,
     load_clock_report,
     load_quest_view,
 )
@@ -1694,10 +1696,28 @@ def test_quest_view(tmp_root: Path) -> None:
         aligned is not None
         and aligned["alignment"] == QUEST_ALIGNMENT_SDK_UNIX
         and aligned["time_unit"] == "s"
-        and aligned["alignment_note"] == QUEST_ALIGNED_NOTE
+        and aligned["alignment_note"] == QUEST_ALIGNED_VERIFIED_NOTE
         and aligned["time"][0] == 0.0
         and aligned["time"][3] is None,
         str(aligned and aligned["time"]),
+    )
+
+    # unix 模式：不要报告，SDK 戳直接当主机墙钟 → 同样是「相对手套首帧秒」。
+    with h5py.File(path, "r") as opened:
+        plain = load_quest_view(
+            opened,
+            100,
+            alignment=QUEST_ALIGNMENT_UNIX,
+            cap_unix_ns=base_ns,
+        )
+    check(
+        "Quest 可视化/unix 模式免报告也可对齐",
+        plain is not None
+        and plain["alignment"] == QUEST_ALIGNMENT_UNIX
+        and plain["time_unit"] == "s"
+        and plain["alignment_note"] == QUEST_ALIGNED_NOTE
+        and plain["time"][0] == 0.0,
+        str(plain and plain["time"][:3]),
     )
 
     rejected = dict(report)

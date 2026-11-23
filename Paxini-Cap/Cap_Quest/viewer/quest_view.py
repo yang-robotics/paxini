@@ -17,10 +17,19 @@ import numpy as np
 
 
 QUEST_ALIGNMENT = "none"
+#: SDK 时间戳就是主机墙钟，直接对齐（与 align_capture.py 的默认模式一致）。
+QUEST_ALIGNMENT_UNIX = "unix"
+#: 经 C8 报告的时钟模型换算后再对齐。
 QUEST_ALIGNMENT_SDK_UNIX = "sdk_unix"
+QUEST_ALIGNMENT_ACTIVE = (QUEST_ALIGNMENT_UNIX, QUEST_ALIGNMENT_SDK_UNIX)
 QUEST_ALIGNMENT_NOTE = "Quest 使用独立 SDK 时间轴，未做跨源时间对齐"
-QUEST_ALIGNED_NOTE = "Quest 已按 C8 验证的 Unix 时钟对齐到手套首帧"
-QUEST_ALIGNMENT_CHOICES = (QUEST_ALIGNMENT, QUEST_ALIGNMENT_SDK_UNIX)
+QUEST_ALIGNED_NOTE = "Quest 已按 Unix 墙钟对齐到手套首帧（未经 C8 验证）"
+QUEST_ALIGNED_VERIFIED_NOTE = "Quest 已按 C8 验证的 Unix 时钟对齐到手套首帧"
+QUEST_ALIGNMENT_CHOICES = (
+    QUEST_ALIGNMENT,
+    QUEST_ALIGNMENT_UNIX,
+    QUEST_ALIGNMENT_SDK_UNIX,
+)
 
 
 def take_evenly(rows: int, limit: int) -> np.ndarray:
@@ -211,47 +220,55 @@ def load_quest_view(
     alignment_mode = alignment
     alignment_note = QUEST_ALIGNMENT_NOTE
     alignment_clock_domain = None
-    if alignment == QUEST_ALIGNMENT_SDK_UNIX:
+    if alignment in QUEST_ALIGNMENT_ACTIVE:
         if not cap_unix_ns or cap_unix_ns <= 0:
-            raise ValueError("sdk_unix 对齐需要手套首帧 Unix 时间")
-        if clock_report is None:
-            raise ValueError("sdk_unix 对齐需要已验证的 C8 时钟报告")
-        limits = clock_report.get("thresholds") or {}
-        min_valid_fraction = float(limits.get("min_valid_fraction", 0.95))
-        max_backwards = int(limits.get("max_backwards_steps", 0))
-        max_run = int(limits.get("max_same_timestamp_run", 10))
-        failures: list[str] = []
-        if not sdk_usable:
-            failures.append("SDK 时间戳没有可用的递增时间轴")
-        if sdk_valid_fraction < min_valid_fraction:
-            failures.append(
-                f"有效时间戳比例 {sdk_valid_fraction:.3f} 低于 {min_valid_fraction:.3f}"
-            )
-        if sdk_backwards > max_backwards:
-            failures.append(f"时间戳倒退 {sdk_backwards} 次")
-        if sdk_max_run > max_run:
-            failures.append(
-                f"同一时间戳连续重复 {sdk_max_run} 次，超过 {max_run}"
-            )
-        if failures:
-            raise ValueError(
-                "当前 data.h5 不满足 C8 对齐条件：" + "；".join(failures)
-            )
-        model = (clock_report.get("models") or {}).get("host_unix")
-        if not isinstance(model, dict):
-            raise ValueError("C8 时钟报告缺少 host_unix 模型")
+            raise ValueError("Quest Unix 对齐需要手套首帧 Unix 时间")
+        model = None
+        if alignment == QUEST_ALIGNMENT_SDK_UNIX:
+            if clock_report is None:
+                raise ValueError("sdk_unix 对齐需要已验证的 C8 时钟报告")
+            limits = clock_report.get("thresholds") or {}
+            min_valid_fraction = float(limits.get("min_valid_fraction", 0.95))
+            max_backwards = int(limits.get("max_backwards_steps", 0))
+            max_run = int(limits.get("max_same_timestamp_run", 10))
+            failures: list[str] = []
+            if not sdk_usable:
+                failures.append("SDK 时间戳没有可用的递增时间轴")
+            if sdk_valid_fraction < min_valid_fraction:
+                failures.append(
+                    f"有效时间戳比例 {sdk_valid_fraction:.3f} 低于 {min_valid_fraction:.3f}"
+                )
+            if sdk_backwards > max_backwards:
+                failures.append(f"时间戳倒退 {sdk_backwards} 次")
+            if sdk_max_run > max_run:
+                failures.append(
+                    f"同一时间戳连续重复 {sdk_max_run} 次，超过 {max_run}"
+                )
+            if failures:
+                raise ValueError(
+                    "当前 data.h5 不满足 C8 对齐条件：" + "；".join(failures)
+                )
+            candidate = (clock_report.get("models") or {}).get("host_unix")
+            if not isinstance(candidate, dict):
+                raise ValueError("C8 时钟报告缺少 host_unix 模型")
+            model = candidate
+        # unix 模式下 model 保持 None：SDK 戳本身就是主机墙钟，不需要换算。
         time_values = []
         for value in sdk_raw[index]:
             value = int(value)
             if value <= 0:
                 time_values.append(None)
                 continue
-            host_unix = _sdk_to_unix_ns(value, model)
+            host_unix = _sdk_to_unix_ns(value, model) if model is not None else value
             time_values.append(round((host_unix - cap_unix_ns) / 1e9, 6))
         time_source = "sdk_timestamp_ns"
         time_label = "相对手套首帧时间 (s)"
         time_unit = "s"
-        alignment_note = QUEST_ALIGNED_NOTE
+        alignment_note = (
+            QUEST_ALIGNED_NOTE
+            if model is None
+            else QUEST_ALIGNED_VERIFIED_NOTE
+        )
         alignment_clock_domain = "unix_epoch"
     elif sdk_usable:
         time_values = _relative_ms(sdk_raw, index, sdk_base)

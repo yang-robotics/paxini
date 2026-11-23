@@ -528,7 +528,7 @@ def align_quest_to_targets(
     if failures:
         raise AlignError("当前 data.h5 不满足 Quest 对齐条件：" + "；".join(failures))
     for message in warnings:
-        warn(f"Quest 时间戳质量提示：{message}（继续处理，下游看 valid_fraction）")
+        warn(f"Quest 时间戳质量提示：{message}（继续处理，缺的行体现为 quest/valid=false）")
 
     model: dict[str, Any] | None = None
     if mode == QUEST_ALIGNMENT_SDK_UNIX:
@@ -588,7 +588,8 @@ def align_quest_to_targets(
         "clock_report_sha256": report_sha256,
         "clock_model": model,
         "paired_rows": int(np.count_nonzero(valid)),
-        "valid_fraction": (
+        # 命名要能自证：这是「多少相机行配到了样本」，不是源文件的时间戳有效率。
+        "paired_fraction": (
             float(np.count_nonzero(valid)) / targets.size if targets.size else 0.0
         ),
         "age_stats_ms": {
@@ -1139,7 +1140,7 @@ def aligned_summary(result: dict[str, Any]) -> dict[str, Any]:
             "paired_rows": quest["paired_rows"],
             "invalid_rows": int(result["aligned_rows"] - quest["paired_rows"]),
             # paired_fraction = 多少相机行找到了样本（真正的「覆盖率」）
-            "paired_fraction": round(float(quest["valid_fraction"]), 6),
+            "paired_fraction": round(float(quest["paired_fraction"]), 6),
             "minimum_paired_fraction": result["quest_min_valid_fraction"],
             "max_age_ms": quest["max_age_ms"],
             "age_ms": {
@@ -1240,7 +1241,7 @@ def report(result: dict[str, Any], path: Path | None, delay_source: str) -> None
             "{:.2f}/{:.2f}/{:.2f} ms（上限 {:.1f} ms）".format(
                 quest["source_rows"],
                 quest["paired_rows"],
-                quest["valid_fraction"] * 100.0,
+                quest["paired_fraction"] * 100.0,
                 age["median"] or 0.0,
                 age["p99"] or 0.0,
                 age["max"] or 0.0,
@@ -1311,7 +1312,7 @@ def gates(result: dict[str, Any]) -> list[str]:
         minimum = float(
             result.get("quest_min_valid_fraction", DEFAULT_QUEST_MIN_VALID_FRACTION)
         )
-        actual = float(quest["valid_fraction"])
+        actual = float(quest["paired_fraction"])
         if actual < minimum:
             problems.append(f"Quest 有效配对 {actual:.1%} 低于 {minimum:.1%}")
     return problems
@@ -1370,7 +1371,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Quest 有效配对比例门槛，默认 "
             f"{DEFAULT_QUEST_MIN_VALID_FRACTION:g}；仅 sdk_unix 模式生效"
-            "（未达标即不写输出文件），unix 模式只提示"
+            "（未达标即不写输出文件），unix 模式忽略"
         ),
     )
     return parser
@@ -1392,6 +1393,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not 0.0 <= args.quest_min_valid_fraction <= 1.0:
         error("--quest-min-valid-fraction 必须在 0..1")
         return 2
+    if (
+        args.quest_clock_report is not None
+        and args.quest_align != QUEST_ALIGNMENT_SDK_UNIX
+    ):
+        warn(
+            "给了 --quest-clock-report 但 --quest-align 不是 sdk_unix，报告不会被使用"
+            "（unix 模式不需要 C8 验证）"
+        )
     quest_report = None
     quest_report_sha256 = None
     if args.quest_align == QUEST_ALIGNMENT_SDK_UNIX:
@@ -1442,6 +1451,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{recording.name}: 质量判据未通过，不写输出文件"
                     "（要产出先修数据；--dry-run 与这里一样只看统计）"
                 )
+                if int(result.get("dropped_by_quest") or 0) > 0:
+                    # 行数不足常常不是数据坏，而是 Quest 覆盖不到首尾：默认对齐把
+                    # 那些帧整行裁掉了。这条提示能省掉一次「以为是手套丢帧」的排查。
+                    warn(
+                        f"{recording.name}: 其中 {result['dropped_by_quest']} 帧是因为"
+                        " Quest 有效区间没覆盖到而被裁掉；若这次不需要 Quest，"
+                        "用 --quest-align none 可保留这些行"
+                    )
             else:
                 log("  自检：主时间轴严格递增、关节角无 NaN、counts 合计 444 —— 通过")
             out_dir = (

@@ -48,9 +48,9 @@ Paxini-Dex/   会运动
 | 相机延迟测量 | 工具可用，**两路已在原生 V4L2 实测**（2026-11-21：cam0 84.7 ms / cam1 87.6 ms，台账 `latency/records/ifnot-ubuntu.yaml`）；改硬件或参数后要重测 |
 | Quest 采集 | XRoboToolKit 真机已跑通；SDK 时间戳跨源时钟域未验证 |
 | 相机内参/外参 | **不做**（2026-11-17 决定划出范围，下游扩散模型只吃图像、不算位姿，见 `DOC/待验证清单.md` E8） |
-| 跨源对齐 | **手套已实现；Quest 可选**：`Paxini-Align/align_capture.py` 相机时刻为主轴，手套插值；Quest 只在通过 C8 报告且文件时间戳质量达标时取“之前最近”样本 |
+| 跨源对齐 | **手套与 Quest 都已实现**：`Paxini-Align/align_capture.py` 相机时刻为主轴，手套插值；Quest **默认**按 Unix 墙钟取“之前最近”样本并整行复制（免 C8 报告，summary 标 `clock_domain_verified`），要走 C8 验证的口径用 `--quest-align sdk_unix` |
 
-一句话：**能采、能按 C8 门控做时序配对；不能算三维，也没有 Quest 采样链路延迟标定。**
+一句话：**能采、能做三源时序配对（Quest 默认开启，C8 验证可选）；不能算三维，也没有 Quest 采样链路延迟标定。**
 
 ## 文档权威矩阵
 
