@@ -482,6 +482,7 @@ def test_quest_duplicate_tie_break(tmp: Path) -> None:
         paired = ac.align_quest_to_targets(
             f,
             np.asarray([target], dtype=np.int64),
+            ac.QUEST_ALIGNMENT_SDK_UNIX,
             report,
             digest,
             25.0,
@@ -490,6 +491,80 @@ def test_quest_duplicate_tie_break(tmp: Path) -> None:
         "同一时间戳重复时，因果配对取源文件中最后一行",
         int(paired["index"][0]) == 5 and bool(paired["valid"][0]),
         f"选中行 {int(paired['index'][0])}",
+    )
+
+
+def test_quest_unix_mode_interpolates(tmp: Path) -> None:
+    """unix 模式：不要 C8 报告，位姿按时间线性插值，四元数保持单位长度。"""
+    # 不带单调钟列，时间基才会选 unix —— 于是 timestamp_ns 本身就是 Unix，
+    # 可以直接和合成 Quest 的 sdk 时间戳逐行比。
+    rec = make_recording(tmp, with_mono=False)
+    add_quest(rec)
+    result = run(rec, quest_alignment=ac.QUEST_ALIGNMENT_UNIX)
+    quest = result["quest"]
+    out = ac.write_aligned(result, tmp / "unix_out")
+    with h5py.File(out) as f:
+        ts = f["timestamp_ns"][:].astype(np.int64)
+        pose = f["quest/data/pose_6d"][:]
+        sequence = f["quest/data/sequence"][:]
+        interp_flag = f["quest/data/tracked"][:]
+    # 合成数据里 pose.x = (sdk - t0) / 1e9，所以插值正确的判据是逐行精确相等。
+    expected = (ts - 1_700_000_000_000_000_000) / 1e9
+    error = np.abs(pose[:, 0] - expected)
+    norm = np.linalg.norm(pose[:, 3:7], axis=1)
+    check(
+        "unix 模式免 C8 报告，位姿插值与时间线性一致",
+        quest["mode"] == ac.QUEST_ALIGNMENT_UNIX
+        and quest["valid_fraction"] > 0.9
+        and float(error.max()) < 1e-6,
+        f"mode={quest['mode']} 有效={quest['valid_fraction']:.3f} "
+        f"最大误差={float(error.max()):.2e}",
+    )
+    check(
+        "四元数插值后仍是单位长度",
+        float(np.abs(norm - 1.0).max()) < 1e-9,
+        f"max |norm-1| = {float(np.abs(norm - 1.0).max()):.2e}",
+    )
+    check(
+        "整数与布尔字段取左邻而非插值",
+        np.all(np.diff(sequence.astype(np.int64)) >= 0)
+        and bool(np.all(interp_flag)),
+        f"sequence 单调={bool(np.all(np.diff(sequence.astype(np.int64)) >= 0))}",
+    )
+
+
+def test_quat_nlerp(tmp: Path) -> None:
+    """四元数走短弧：q 与 -q 表示同一旋转，插值结果必须一致。"""
+    a = np.array([[0.0, 0.0, 0.0, 1.0]])
+    b = np.array([[0.0, 0.0, 0.7071068, 0.7071068]])      # 绕 z 轴 90°
+    mid = ac._nlerp_quat(a, b, np.array([0.5]))
+    same_arc = np.allclose(mid, ac._nlerp_quat(a, -b, np.array([0.5])), atol=1e-12)
+    check(
+        "四元数 nlerp 走短弧并归一化",
+        same_arc and abs(float(mid[0, 3]) - 0.9238795) < 1e-5
+        and abs(float(np.linalg.norm(mid[0]))) - 1.0 < 1e-12,
+        f"q=({float(mid[0, 2]):.4f},{float(mid[0, 3]):.4f}) 反号一致={same_arc}",
+    )
+
+
+def test_quest_unix_mode_tolerates_low_quality(tmp: Path) -> None:
+    """unix 模式下时间戳重复/覆盖率低只警告；sdk_unix 才硬失败。"""
+    rec = make_recording(tmp)
+    add_quest(rec, start_s=0.025)
+    with h5py.File(rec / "data.h5", "r+") as f:
+        sdk = f["quest/sdk_timestamp_ns"][:].astype(np.int64)
+        sdk[-max(10, sdk.size // 5):] = 0          # 20% 无效，低于 95%
+        f["quest/sdk_timestamp_ns"][:] = sdk
+    try:
+        result = run(rec, quest_alignment=ac.QUEST_ALIGNMENT_UNIX)
+    except ac.AlignError as exc:  # pragma: no cover - 回归保护
+        check("unix 模式对低质量时间戳只警告", False, str(exc)[:60])
+        return
+    warnings = result["quest"]["quality_warnings"]
+    check(
+        "unix 模式对低质量时间戳只警告",
+        any("比例" in item for item in warnings) and result["quest"]["valid_fraction"] > 0,
+        "；".join(warnings)[:60],
     )
 
 
@@ -592,7 +667,7 @@ def test_quest_file_quality_gate(tmp: Path) -> None:
     except ac.AlignError as exc:
         check(
             "当前文件时间戳质量不达 C8 门槛时硬失败",
-            "不满足 C8 对齐条件" in str(exc),
+            "不满足 Quest 对齐条件" in str(exc),
             str(exc)[:60],
         )
     else:
@@ -828,6 +903,9 @@ def main() -> int:
             test_timebase_selection, test_multi_camera_views, test_write_and_reopen,
             test_gates_pass, test_clock_offset_column, test_quality_gate_blocks_write, test_rejects_unsorted, test_write_flag_repair, test_lookup3_vector,
             test_quest_causal_pairing, test_quest_duplicate_tie_break,
+            test_quest_unix_mode_interpolates,
+            test_quat_nlerp,
+            test_quest_unix_mode_tolerates_low_quality,
             test_quest_clock_model_inverse,
             test_quest_missing_semantics, test_quest_full_group_written,
             test_quest_file_quality_gate, test_quest_coverage_gate,
