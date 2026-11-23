@@ -557,6 +557,49 @@ def test_quest_unix_mode_ignores_source_coverage(tmp: Path) -> None:
     )
 
 
+def test_quest_pose_nan_not_used(tmp: Path) -> None:
+    """时间戳有效但姿态是 NaN 的行不能当候选。
+
+    PC Service 掉线后 getter 返回默认值，时间戳可能还在走而 pose 已经全 NaN。
+    这种行如果进了候选集，产物会长成「valid 全 true、pose 全 NaN」，训练侧无从分辨。
+    """
+    rec = make_recording(tmp, with_mono=False)
+    add_quest(rec)
+    with h5py.File(rec / "data.h5", "r+") as f:
+        f["quest/pose_6d"][:] = np.nan
+    try:
+        run(rec, quest_alignment=ac.QUEST_ALIGNMENT_UNIX)
+    except ac.AlignError as exc:
+        check(
+            "Quest 姿态全 NaN 时明确报错而不是产出全 NaN 的 valid 行",
+            "pose_6d" in str(exc) and "NaN" in str(exc),
+            str(exc)[:60],
+        )
+    else:
+        check(
+            "Quest 姿态全 NaN 时明确报错而不是产出全 NaN 的 valid 行",
+            False,
+            "没有抛错",
+        )
+
+    partial = make_recording(tmp / "partial", with_mono=False)
+    add_quest(partial)
+    with h5py.File(partial / "data.h5", "r+") as f:
+        pose = f["quest/pose_6d"][:]
+        start = pose.shape[0] // 3
+        pose[start: start + 60] = np.nan           # 0.5 s 的姿态缺失
+        f["quest/pose_6d"][:] = pose
+    result = run(partial, quest_alignment=ac.QUEST_ALIGNMENT_UNIX)
+    quest = result["quest"]
+    check(
+        "中间姿态缺失的行被剔除并落成 valid=false",
+        quest["pose_excluded_rows"] == 60
+        and int(np.count_nonzero(~quest["valid"])) > 0,
+        f"剔除 {quest['pose_excluded_rows']} 行，"
+        f"valid=false {int(np.count_nonzero(~quest['valid']))} 行",
+    )
+
+
 def test_quest_clock_model_inverse(tmp: Path) -> None:
     del tmp
     t0 = 1_700_000_000_000_000_000
@@ -894,6 +937,7 @@ def main() -> int:
             test_quest_causal_pairing, test_quest_duplicate_tie_break,
             test_quest_unix_mode_takes_previous_row,
             test_quest_unix_mode_ignores_source_coverage,
+            test_quest_pose_nan_not_used,
             test_quest_clock_model_inverse,
             test_quest_missing_semantics, test_quest_full_group_written,
             test_quest_file_quality_gate, test_quest_coverage_gate,

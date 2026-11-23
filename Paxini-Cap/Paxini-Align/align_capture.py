@@ -537,7 +537,35 @@ def align_quest_to_targets(
             raise AlignError("C8 时钟报告缺少 host_unix 模型")
         model = candidate
 
-    valid_indices = np.flatnonzero(raw > 0).astype(np.int64)
+    # 「有时间戳」不等于「有姿态」：PC Service 掉线后 getter 会返回默认值，
+    # 时间戳可能仍在走而 pose_6d 已经整段是 NaN。这种行如果进了候选集，会产出
+    # 一份 pose 全 NaN 但 valid=true 的产物——训练侧无从分辨。所以候选集要求
+    # 位置三个分量都有限；坏行直接不进候选，前驱自然跳到更早的有效样本上，
+    # 如果那段太长就会被 max_age 判成 valid=false。
+    stamp_indices = np.flatnonzero(raw > 0).astype(np.int64)
+    if stamp_indices.size < 1:
+        raise AlignError("Quest 没有任何有效时间戳")
+    pose_excluded = 0
+    if "quest/pose_6d" in handle:
+        pose = np.asarray(handle["quest/pose_6d"][:], dtype=np.float64)
+        if pose.shape[0] != raw.size or pose.ndim != 2 or pose.shape[1] < 3:
+            raise AlignError("quest/pose_6d 形状与 sdk_timestamp_ns 不匹配")
+        position_finite = np.isfinite(pose[:, :3]).all(axis=1)
+        keep_pose = position_finite[stamp_indices]
+        pose_excluded = int(stamp_indices.size - np.count_nonzero(keep_pose))
+        valid_indices = stamp_indices[keep_pose]
+        if valid_indices.size < 1:
+            raise AlignError(
+                "Quest 有有效时间戳，但 pose_6d 的位置分量全部是 NaN："
+                "PC Service 掉线后 getter 返回了默认值。这份采集没有可用的姿态数据"
+            )
+        if pose_excluded:
+            warn(
+                f"Quest 有 {pose_excluded} 行时间戳有效但姿态为 NaN，"
+                "已从候选里剔除（这些位置会表现为 quest/valid=false）"
+            )
+    else:
+        valid_indices = stamp_indices
     if valid_indices.size < 1:
         raise AlignError("Quest 没有任何有效样本")
     valid_raw = raw[valid_indices]
@@ -585,6 +613,7 @@ def align_quest_to_targets(
         "timestamp_host_unix_ns": selected_host,
         "quality": quality,
         "quality_warnings": warnings,
+        "pose_excluded_rows": pose_excluded,
         "clock_report_sha256": report_sha256,
         "clock_model": model,
         "paired_rows": int(np.count_nonzero(valid)),
@@ -793,6 +822,7 @@ def align_recording(
                 keep &= quest_ok
 
         dropped = int(keep.size - np.count_nonzero(keep))
+        extrapolated: np.ndarray | None = None
         if not keep_outside:
             master_t = master_t[keep]
             master_unix_t = master_unix_t[keep]
@@ -801,6 +831,10 @@ def align_recording(
         else:
             ref_raw = reference_t
             ref_index = np.arange(reference_t.size, dtype=np.int32)
+            # --keep-outside 保留了落在窗口外的帧。它们没有真实的手套数据，
+            # bracket 会 clamp 到首/末帧，于是这些行的关节角等于边界帧的克隆，
+            # 而 span_ms 看起来完全正常。留一列掩码，别让下游把填充值当真值。
+            extrapolated = ~keep
 
         if master_t.size == 0:
             raise AlignError(
@@ -910,6 +944,7 @@ def align_recording(
         "glove_left": left.astype(np.int32),
         "glove_right": right.astype(np.int32),
         "weights": w,
+        "extrapolated": extrapolated,
         "glove_span_ms": span_ns.astype(np.float64) / 1e6,
         "glove_offset_ms": offset_ns.astype(np.float64) / 1e6,
         "distribution": distribution_note,
@@ -1086,6 +1121,9 @@ def write_aligned(result: dict[str, Any], output_dir: Path) -> Path:
         # True only when the camera instant actually fell between two glove frames;
         # a row that lands on a glove frame needs no interpolation.
         glove.create_dataset("interpolated", data=(weights > 1e-9) & (weights < 1.0 - 1e-9))
+        if result.get("extrapolated") is not None:
+            # True = 该行落在手套覆盖范围之外，数值是边界帧的克隆（--keep-outside）
+            glove.create_dataset("extrapolated", data=result["extrapolated"], dtype=bool)
 
         state = out.create_group("state")
         for name, values in result["state"].items():
@@ -1184,6 +1222,11 @@ def aligned_summary(result: dict[str, Any]) -> dict[str, Any]:
         "dropped_by_quest": result.get("dropped_by_quest", 0),
         "valid_windows": result.get("windows", {}),
         "interpolated_rows": interpolated,
+        "extrapolated_rows": (
+            int(np.count_nonzero(result["extrapolated"]))
+            if result.get("extrapolated") is not None
+            else 0
+        ),
         "glove_span_ms": {
             "median": round(float(np.median(span)), 3),
             "p95": round(float(np.percentile(span, 95)), 3),
@@ -1223,6 +1266,11 @@ def report(result: dict[str, Any], path: Path | None, delay_source: str) -> None
         )
     log("  插值跨度 median {:.2f} ms / p95 {:.2f} ms / max {:.2f} ms".format(
         span_stats["median"], span_stats["p95"], span_stats["max"]))
+    if summary["extrapolated_rows"]:
+        warn(
+            f"{summary['extrapolated_rows']}/{result['aligned_rows']} 行落在手套覆盖范围外，"
+            "数值是边界帧的克隆（glove/extrapolated=true）；--keep-outside 只用于调试"
+        )
     ratio = summary["interpolated_rows"] / max(result["aligned_rows"], 1)
     log(f"  真插值 {summary['interpolated_rows']} 行（{ratio * 100:.1f}%），其余正好落在手套帧上")
     log(f"  相机空洞 {result['holes']} 处（>{HOLE_FACTOR}× 中位间隔）")
