@@ -218,6 +218,20 @@ gh release create <名字> --verify-tag --title "..." --notes-file ... <资产..
 Release 按标签名关联，所以"改指向"只能删标签再重建。**删标签那一刻 Release 会变成 `draft=true`**，
 重建标签也不会自动恢复——资产对外不可见，`gh release list` 里显示 `Draft`。
 
+**删任何标签之前先查它挂没挂 Release**。标签删了还能重建，但 Release 与标签的关联断了，
+资产的下载 URL 会变成 `untagged-<hash>` 这种不可预测的形式：
+
+```bash
+gh release list --repo <owner>/<repo>          # 看 tag 名对不对得上
+gh release view <tag> --json isDraft,assets    # 看是不是 draft、资产还在不在
+```
+
+> 2026-11-24 踩过：为了把 clone 体积从 264 MB 降到 20 MB，删掉了 `data-sample-20261117`
+> 这个指向 220 MB 样例视频的标签。删之前只确认了「数据在 `Recordings/` 里有哈希一致的
+> 副本」，没查它关联的 Release——删完才发现那个 Release 是 draft（资产 263 MB 还在，
+> 但失去了标签，`gh release edit --draft=false` 也就无从执行）。
+> 结论：标签可以删，但**先看清楚它背后挂着什么**。
+
 ```bash
 gh release edit <tag> --draft=false            # 重新发布
 gh release edit <tag> --latest                 # 需要占 Latest 位置时再补一句
