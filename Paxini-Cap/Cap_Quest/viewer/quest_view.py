@@ -3,13 +3,16 @@
 The module never resamples Quest onto the camera grid -- that is
 ``align_capture.py``'s job. It only decides which time axis to *draw* on:
 
-* ``unix`` (default) -- render the SDK stamps as seconds relative to the glove's
-  first frame, i.e. the same wall-clock axis the aligner uses.
-* ``sdk_unix`` -- same axis, but through a passing C8 report's affine model.
+* ``auto`` (default) -- ``host`` when the file has ``quest/host_unix_ns``, else
+  ``unix``.
+* ``host`` -- render the host receive times as seconds relative to the glove's
+  first frame; no C8 report needed.
+* ``unix`` -- same axis using the SDK stamps (old files).
+* ``sdk_unix`` -- same axis through a passing C8 report's affine model.
 * ``none`` -- keep Quest on its own SDK time base (normalised progress).
 
-The payload says which one it used, and the viewer labels the difference between
-"aligned but unverified" and "aligned and C8-verified" explicitly.
+The payload says which one it used, and the viewer labels host / unix-unverified /
+C8-verified explicitly.
 """
 
 from __future__ import annotations
@@ -24,19 +27,45 @@ import numpy as np
 
 
 QUEST_ALIGNMENT = "none"
-#: SDK 时间戳就是主机墙钟，直接对齐（与 align_capture.py 的默认模式一致）。
+#: SDK 时间戳就是主机墙钟，直接对齐（老文件）。
 QUEST_ALIGNMENT_UNIX = "unix"
-#: 经 C8 报告的时钟模型换算后再对齐。
+#: 经 C8 报告的时钟模型换算后再对齐（老文件）。
 QUEST_ALIGNMENT_SDK_UNIX = "sdk_unix"
-QUEST_ALIGNMENT_ACTIVE = (QUEST_ALIGNMENT_UNIX, QUEST_ALIGNMENT_SDK_UNIX)
+#: New captures carry `quest/host_unix_ns`: PC receive time, no C8.
+QUEST_ALIGNMENT_HOST = "host"
+#: Use host when present, else fall back to unix (default for new captures).
+QUEST_ALIGNMENT_AUTO = "auto"
+QUEST_ALIGNMENT_ACTIVE = (
+    QUEST_ALIGNMENT_UNIX,
+    QUEST_ALIGNMENT_HOST,
+    QUEST_ALIGNMENT_SDK_UNIX,
+)
 QUEST_ALIGNMENT_NOTE = "Quest 使用独立 SDK 时间轴，未做跨源时间对齐"
 QUEST_ALIGNED_NOTE = "Quest 已按 Unix 墙钟对齐到手套首帧（未经 C8 验证）"
+QUEST_ALIGNED_HOST_NOTE = "Quest 已按主机接收时刻对齐到手套首帧（无需 C8）"
 QUEST_ALIGNED_VERIFIED_NOTE = "Quest 已按 C8 验证的 Unix 时钟对齐到手套首帧"
 QUEST_ALIGNMENT_CHOICES = (
     QUEST_ALIGNMENT,
+    QUEST_ALIGNMENT_AUTO,
     QUEST_ALIGNMENT_UNIX,
+    QUEST_ALIGNMENT_HOST,
     QUEST_ALIGNMENT_SDK_UNIX,
 )
+
+
+def resolve_quest_alignment(handle: Any, alignment: str) -> str:
+    """``auto`` -> host when the new host columns are present, else unix.
+
+    The column is the capability; ``format_version`` 5 documents it. Keying on
+    the column keeps a partial old file safely on the ``unix`` fallback.
+    """
+    if alignment != QUEST_ALIGNMENT_AUTO:
+        return alignment
+    return (
+        QUEST_ALIGNMENT_HOST
+        if "quest" in handle and "quest/host_unix_ns" in handle
+        else QUEST_ALIGNMENT_UNIX
+    )
 
 
 def take_evenly(rows: int, limit: int) -> np.ndarray:
@@ -194,6 +223,7 @@ def load_quest_view(
     """
     if alignment not in QUEST_ALIGNMENT_CHOICES:
         raise ValueError(f"未知 Quest 对齐模式：{alignment!r}")
+    alignment = resolve_quest_alignment(handle, alignment)
     if "quest" not in handle or "quest/sdk_timestamp_ns" not in handle:
         return None
     total = int(handle["quest/sdk_timestamp_ns"].shape[0])
@@ -232,7 +262,30 @@ def load_quest_view(
     alignment_mode = alignment
     alignment_note = QUEST_ALIGNMENT_NOTE
     alignment_clock_domain = None
-    if alignment in QUEST_ALIGNMENT_ACTIVE:
+    time_based = False
+    host_raw = (
+        handle["quest/host_unix_ns"][:].astype(np.int64)
+        if "quest/host_unix_ns" in handle
+        else None
+    )
+    if alignment == QUEST_ALIGNMENT_HOST:
+        if not cap_unix_ns or cap_unix_ns <= 0:
+            raise ValueError("Quest 主机接收时刻对齐需要手套首帧 Unix 时间")
+        if host_raw is None:
+            raise ValueError("host 对齐需要 quest/host_unix_ns 数据集")
+        time_values = []
+        for value in host_raw[index]:
+            value = int(value)
+            time_values.append(
+                None if value <= 0 else round((value - cap_unix_ns) / 1e9, 6)
+            )
+        time_source = "host_unix_ns"
+        time_label = "相对手套首帧时间 (s)"
+        time_unit = "s"
+        alignment_note = QUEST_ALIGNED_HOST_NOTE
+        alignment_clock_domain = "host_unix"
+        time_based = True
+    elif alignment in QUEST_ALIGNMENT_ACTIVE:
         if not cap_unix_ns or cap_unix_ns <= 0:
             raise ValueError("Quest Unix 对齐需要手套首帧 Unix 时间")
         model = None
@@ -283,6 +336,7 @@ def load_quest_view(
             else QUEST_ALIGNED_VERIFIED_NOTE
         )
         alignment_clock_domain = "unix_epoch"
+        time_based = True
     elif sdk_usable:
         time_values = _relative_ms(sdk_raw, index, sdk_base)
         time_source = "sdk_timestamp_ns"
@@ -375,6 +429,7 @@ def load_quest_view(
         "alignment": alignment_mode,
         "alignment_clock_domain": alignment_clock_domain,
         "alignment_note": alignment_note,
+        "time_based": time_based,
         "quality": {
             "sdk_valid_timestamps": sdk_valid_count,
             "sdk_missing_timestamps": sdk_missing,

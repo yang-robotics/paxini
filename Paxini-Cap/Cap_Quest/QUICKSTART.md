@@ -143,7 +143,7 @@ python3.10 capture/collect_cap.py \
 ```
 
 启动后程序先进**待机闸门**：Quest 轮询和手套连续采集先跑，等到选定位姿
-`--quest-ready-samples` 条连续有效且最近 0.5 秒有变化、手套真实出帧，才启动相机并等每路
+`--quest-ready-samples` 条连续有效、手套真实出帧，才启动相机并等每路
 首帧；然后终端打印「准备完毕」。
 
 - **按任意一个键开始采集**（不用回车）。`data.h5` 只在按键后创建，Quest/手套的待机样本
@@ -161,9 +161,8 @@ python3.10 capture/collect_cap.py \
 - 三路都配置后，任何一路断流都会中止整场：日志出现 `[错误] 采集中止：…`，
   `manifest.runtime.abort_reason` 记同一个原因。
 - **采 Quest 时必须戴上并解锁头显、让 XRoboToolKit 保持前台**；锁屏/摘下会让 APK 暂停，
-  5 秒没有有效选定位姿就中止（`manifest.runtime.quest_pose_stale_limit_s`）。右手柄休眠时
-  头显还在更新，`quest/tracked` 仍是 true，所以判据是**选定位姿的 7 个数不再变化**，不是
-  那个或标志。
+  5 秒没有有效 tracking 数据才中止。右手柄静止/休眠时头显还在更新，`quest/tracked` 仍是
+  true；选定位姿 1 秒没变化只 warn（静止是合法数据），不再中止整场。
 
 采完把 NTP 开回来：
 
@@ -201,8 +200,10 @@ PY
 手套行数必须非零；采了 Quest 时 `quest_rows` 和 `quest.valid_rows` 都必须非零
 （`valid_rows` 才是真正带 tracking 数据的行）；两路相机有帧；`row_mismatch` 为空。
 
-启动失败时目录里是 `startup_failure.json`（没有 `data.h5`），先看 `error`、`command_text`
-和 `log_tail`。退出码：`0` 正常，`2` 启动失败或中止，`130` 第二次 `Ctrl+C` 强制结束。
+启动失败时诊断在 `Recordings/_startup_failures/<时间戳>_<原因>/startup_failure.json`
+（没有 `data.h5`，也不占 `data_*` 编号），先看 `error`、`command_text` 和 `log_tail`。
+退出码：`0` 正常，`2` 启动失败或中止，`130` 第二次 `Ctrl+C` 强制结束；待机期按 Ctrl+C
+只清掉本次输出目录、不写失败工件。
 
 ## 6. 回放（可选）
 
@@ -229,4 +230,4 @@ Quest 面板、跨源对齐口径和视频面板见 [`README.md`](README.md) §4
 | 相机日志有 `Unrecognized option 'fps_mode'` | ffmpeg < 5.0，装静态版或加 `--ffmpeg` |
 | Quest 起不来 | 检查 PC Service、USB 调试授权、局域网、Tracking/Send；不戴就加 `--no-quest` |
 | 停止时 ffmpeg `-9` | 看对应 `cameras/*.log`，确认相机能响应 SIGINT |
-| 出现 `startup_failure.json` | 本次没有启动；按其中的 `error` / `log_tail` 排查 |
+| `Recordings/_startup_failures/` 里有 `startup_failure.json` | 本次没有启动；按其中的 `error` / `log_tail` 排查 |

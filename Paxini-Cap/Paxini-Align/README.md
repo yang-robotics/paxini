@@ -65,7 +65,7 @@ Quest 的有效区间也可能比相机窄。所以主轴按**四路窗口的交
 | 手套时间戳 | 当作**真实时间戳**，是插值的自变量，不信任何第三方时钟 |
 | 时间对齐方式 | 相机时刻落在两帧手套之间时**线性插值**；落在覆盖范围外则丢弃 |
 | 延迟补偿 | 相机戳是"帧到达主机"的时刻，减去实测 Δ（默认读台账，两路共用同一值）；**台账读不到时 Δ=0 并告警，不再套用历史默认值** |
-| Quest | **默认处理**：直接当主机墙钟用（免报告）；`--quest-align none` 关掉；`sdk_unix` 另需 C8 报告 |
+| Quest | **默认处理**：`--quest-align auto`，新版有 `quest/host_unix_ns` 用主机接收时刻（免报告），老文件回退 `unix`；`--quest-align none` 关掉；`sdk_unix` 另需 C8 报告 |
 | 时钟域 | 自动判定，**没有 CLI 开关**：只有参考相机、其他相机、手套都带 `timestamp_monotonic_ns` 时才用单调钟。当前 V4L2 路径的相机只有墙钟列（`write_camera_timestamps` 的 `monotonic_ns` 恒为 `None`），所以**实际总是墙钟**，靠 `clock_jumps` 查跳变兜底 |
 
 Quest 的 Unix 目标时刻始终来自参考相机的 `timestamp_unix_ns − Δ`。即使主时间基落在单调钟上，
@@ -98,7 +98,7 @@ SDK 时间戳已确认就是主机墙钟，所以**默认就对 Quest 做对齐�
 不需要额外参数**：
 
 ```bash
-python3 align_capture.py <采集目录>              # 默认 --quest-align unix
+python3 align_capture.py <采集目录>              # 默认 --quest-align auto（新文件走 host，旧文件回退 unix）
 python3 align_capture.py <采集目录> --quest-align none   # 不想带 Quest
 ```
 
@@ -112,8 +112,9 @@ python3 align_capture.py <采集目录> --quest-align none   # 不想带 Quest
 批量跑老采集不会因为缺 Quest 而失败。
 
 **实测提醒（2026-11-27）**：`data_20261127_4` / `_2` 的 `sdk_timestamp_ns` 比主机 Unix
-快 **+2.55 / +2.56 s**（30 s 内恒定）。默认 `unix` 会把这个偏移原样带进对齐结果；要用
-`align_capture.py` 的命令行 `--quest-align sdk_unix` 才换算掉。
+快 **+2.55 / +2.56 s**（30 s 内恒定）。新采集（format 5）默认 `--quest-align auto`
+直接用 `quest/host_unix_ns`（主机接收时刻），不再有这个问题；只有**老文件**没有 host
+列，才回退 `unix` 或需要 `--quest-align sdk_unix` 换算。
 
 ```bash
 # 1) 单独跑探针（不需要 data.h5；头显保持在线、APK 保持发送）
@@ -134,6 +135,11 @@ python3.10 align_capture.py <采集目录> \
 重复判据按**持续时长**算，不按连续行数：120 Hz 轮询比 SDK 更新快，同一时间戳重复
 20 多行（≈0.2 s）是正常的；只有同一个值持续超过 1 s 才判时钟冻结。探针和本目录的
 `sdk_unix` 检查用同一条规则，所以探针用 30 Hz 或 120 Hz 跑都可以。
+
+**`summary.quest.clock_domain_verified` 的含义**：只有 `sdk_unix`（C8 验证 SDK 时钟域）
+为 `true`；`host` 用实测 PC 接收轴、`unix` 是约定，二者都为 `false`，但 `host` 的
+`summary.quest.alignment` 会写 `host`。对齐输出的 schema 没有变，
+`ALIGNED_FORMAT_VERSION` 仍是 2。
 
 ### Quest 的行选择：整行取前驱
 
@@ -159,7 +165,8 @@ python3.10 align_capture.py <采集目录> \
 整组数据按统一缺失语义写 NaN / False / -1。
 
 `--quest-min-valid-fraction` 默认 `0.95`，**只对 `sdk_unix` 生效**：它比的是源文件里
-「时间戳非 -1 的行占比」，达标才允许做 C8 对齐。`unix` 模式完全不看这个数。
+「时间戳非 -1 的行占比」，达标才允许做 C8 对齐。`host`/`unix` 不看这个数，缺的行
+逐行落成 `quest/valid=false`，用 `summary.quest.paired_fraction` 看实际覆盖率。
 
 当前 `data_20261118_1` / `_2` 的有效 SDK 时间戳只有 90.44% / 86.38%——`unix` 模式下
 仍会产出，但 `quest/valid` 会缺一片，用前先看 `summary.quest.paired_fraction`（多少
@@ -202,7 +209,7 @@ python3.10 align_capture.py <采集目录> \
 | `quest/valid` | (K,) | bool | 是否存在年龄 ≤ `--quest-max-age-ms`、且姿态有限的左邻样本 |
 | `quest/age_ms` | (K,) | float64 | 目标时刻减所选样本的主机 Unix 时刻，即这一行的滞后；无候选时为 NaN。**下游过滤“太旧”的行就看它** |
 | `quest/timestamp_sdk_ns` | (K,) | int64 | 所选样本的原始 SDK 时间戳；无配对时为 `-1` |
-| `quest/timestamp_host_unix_ns` | (K,) | int64 | C8 模型换算后的主机 Unix 时刻；无配对时为 `-1` |
+| `quest/timestamp_host_unix_ns` | (K,) | int64 | 对齐用的主机 Unix 时刻：host 模式直接取 `quest/host_unix_ns`，sdk_unix 模式取 C8 模型换算值；无配对为 `-1` |
 | `quest/data/...` | (K,...) | 原类型 | 完整 `quest/` 数据组按所选行复制，保留嵌套组和属性 |
 
 `attrs["summary"]` 是一份 JSON 摘要（行数、`kept_rows`、按来源的丢弃计数、公共有效窗口、
@@ -212,7 +219,7 @@ max_step_ms, steps_over_5ms}`）。Quest 启用时还会包含 C8 报告 SHA-256
 `glove/clock_offset_ns` 自己求差分。`--delay-ms` 没给、台账也读不到时，
 `camera_delay_source` 会写成「未标定 Δ=0（台账不可用，未做延迟补偿）」——看到这句就说明
 这份产物**没有做延迟补偿**，别拿去和带 Δ 的产物混训。
-`attrs["format_version"]` = **2**，与采集端的 `format_version` 4 是两套编号。
+`attrs["format_version"]` = **2**，与采集端的 `format_version` 5 是两套编号。
 
 `quest/data/` 的无效行按项目统一缺失语义补齐：float → NaN，bool → False，
 计数 → 0，SDK 时间戳 → -1。`quest/` 组自身还带 `alignment`、选样规则、
@@ -237,7 +244,7 @@ cam1 用的是「主轴时刻之前最近的那一帧」，所以 `cameras/right
 | `--nearest-distribution` | 关 | 分布力只取最近帧，省一半读取 |
 | `--dry-run` | 关 | 只统计，不写文件 |
 | `--clear-write-flag` | 关 | `data.h5` 打不开时清写标志，见下 |
-| `--quest-align` | `unix` | `unix`（直接当主机墙钟，免报告）/ `sdk_unix`（需 C8 报告）/ `none`（不处理）；没有 Quest 数据时自动跳过 |
+| `--quest-align` | `auto` | `auto`（有 `quest/host_unix_ns` 用 host，否则回退 unix）/ `host`（主机接收时刻，免报告）/ `unix`（SDK 戳当主机墙钟）/ `sdk_unix`（需 C8 报告）/ `none`；没有 Quest 数据时自动跳过 |
 | `--quest-clock-report` | — | `quest_clock_probe.py` 生成的通过报告 |
 | `--quest-max-age-ms` | `25` | 所选样本距目标时刻允许的最大滞后 |
 | `--quest-min-valid-fraction` | `0.95` | 最小有效配对比例，仅 `sdk_unix` 生效 |
@@ -307,7 +314,7 @@ cam0 那条，两路共用。差 2.9 ms，相对半帧（33 ms）可忽略，所
 ## 自检
 
 ```bash
-python3 selftest.py     # 38 项，不需要硬件，用合成数据精确校验插值与 Quest 门控
+python3 selftest.py     # 41 项，不需要硬件，用合成数据精确校验插值、Quest host/unix/sdk_unix 门控
 ```
 
 覆盖：线性信号零误差还原、Δ 逐行精确相减、边界丢弃计数、

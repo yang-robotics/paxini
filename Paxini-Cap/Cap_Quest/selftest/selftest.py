@@ -4,7 +4,7 @@
 Covers the parts that are easy to get silently wrong:
 
 1. callback frame parsing, including the "read by count, not by 119" rule;
-2. Quest sample collection in ``quest3`` (four SDK timestamps, no host clock);
+2. Quest sample collection in ``quest3`` (four SDK timestamps; QuestPoller adds two host receive timestamps);
 3. Quest row building, with the four timestamps and missing fields;
 4. HDF5 write/read with two independent row axes (glove N, Quest Q);
 5. the per-group row-consistency self check;
@@ -51,7 +51,6 @@ from collect_cap import (
     CAP_MAX_POINTS,
     CAP_SLOT_POINTS,
     CAP_SLOTS,
-    READY_POSE_FRESH_S,
     STOP_EVENT,
     Hdf5Recorder,
     RuntimeMonitor,
@@ -182,6 +181,9 @@ def make_quest_sample(sequence: int, base_ns: int = 1_700_000_000_000_000_000) -
         "body_joints_timestamp_ns": [
             base_ns + sequence * 1_000_000 + 100 + index for index in range(24)
         ],
+        # What QuestPoller adds around the SDK getter bundle.
+        "host_unix_ns": base_ns + sequence * 1_000_000 + 1_000_000,
+        "host_monotonic_ns": 6_000_000_000 + sequence * 1_000_000,
         "tracked": True,
         "head": {
             "available": True,
@@ -331,9 +333,10 @@ def test_quest_row() -> None:
         str({k: v for k, v in row.items() if "timestamp" in k}),
     )
     check(
-        "Quest 行/不再记主机侧时间戳",
-        not any("host" in key for key in row),
-        str([key for key in row if "host" in key]),
+        "Quest 行/记主机接收时刻（对齐用，不是设备采样）",
+        row["quest/host_unix_ns"] == sample["host_unix_ns"]
+        and row["quest/host_monotonic_ns"] == sample["host_monotonic_ns"],
+        str({k: v for k, v in row.items() if "host" in k}),
     )
     check("Quest 行/序号", row["quest/sequence"] == 1)
     check(
@@ -761,7 +764,9 @@ def test_two_row_axes(tmp_root: Path) -> None:
     )
     broken.resize((cap_rows, broken.shape[1]))
 
-    recorder.write_meta({"alignment": "none", "rows": cap_rows})
+    recorder.write_meta(
+        {"alignment": "none", "rows": cap_rows, "format_version": 5}
+    )
     recorder.__exit__(None, None, None)
 
     with h5py.File(output_dir / "data.h5", "r") as handle:
@@ -774,7 +779,12 @@ def test_two_row_axes(tmp_root: Path) -> None:
             handle["quest/sdk_timestamp_ns"].shape == (quest_rows,),
         )
         check(
-            "两轴/quest 四列 SDK 时间戳都在",
+            "两轴/format_version 已升到 5",
+            int(handle["meta"].attrs["format_version"]) == 5,
+            str(handle["meta"].attrs.get("format_version")),
+        )
+        check(
+            "两轴/quest 四列 SDK + 两列主机接收时刻都在",
             all(
                 name in handle["quest"]
                 for name in (
@@ -782,9 +792,10 @@ def test_two_row_axes(tmp_root: Path) -> None:
                     "body_timestamp_ns",
                     "motion_timestamp_ns",
                     "body_joints_timestamp_ns",
+                    "host_unix_ns",
+                    "host_monotonic_ns",
                 )
-            )
-            and not any("host" in name for name in handle["quest"]),
+            ),
         )
         check(
             "两轴/quest 时间戳回读正确",
@@ -1118,7 +1129,8 @@ def test_startup_failure(tmp_root: Path) -> None:
     """Failed startup keeps diagnostics without creating a misleading HDF5."""
     from camera_ffmpeg import FfmpegCamera
 
-    output_dir = tmp_root / "startup_failure"
+    output_dir = tmp_root / "startup_failure_abandoned"
+    failure_dir = tmp_root / "_startup_failures" / "20261127_120000_camera"
     camera_dir = output_dir / "cameras"
     camera = FfmpegCamera(
         "left_cam0",
@@ -1136,7 +1148,7 @@ def test_startup_failure(tmp_root: Path) -> None:
         encoding="utf-8",
     )
     failure = write_startup_failure(
-        output_dir,
+        failure_dir,
         RuntimeError("等待摄像头画面超时"),
         started_at=datetime.now().astimezone(),
         cap_side="left",
@@ -1164,9 +1176,20 @@ def test_startup_failure(tmp_root: Path) -> None:
         not (output_dir / "data.h5").exists(),
     )
     check(
-        "启动失败/保留命令和日志",
+        "启动失败/保留命令和日志到 _startup_failures",
         "v4l2" in (camera_payload["command"] or [])
-        and "No frames received" in camera_payload["log_tail"],
+        and "No frames received" in camera_payload["log_tail"]
+        and failure.name == "startup_failure.json"
+        and failure.parent == failure_dir
+        and (failure_dir / "cameras" / "left_cam0.log").is_file()
+        and camera_payload["log_copy_error"] is None,
+        str(camera_payload),
+    )
+    check(
+        "启动失败/预录 mkv 不保留、路径标 removed",
+        camera_payload["video"] is None
+        and camera_payload["video_removed"] is True
+        and not (failure_dir / "cameras" / "left_cam0.mkv").exists(),
         str(camera_payload),
     )
 
@@ -1780,6 +1803,10 @@ def test_quest_view(tmp_root: Path) -> None:
         quest["body_timestamp_ns"] = np.full(rows, -1, dtype=np.int64)
         quest["motion_timestamp_ns"] = np.full(rows, -1, dtype=np.int64)
         quest["body_joints_timestamp_ns"] = np.full((rows, 24), -1, dtype=np.int64)
+        quest["host_unix_ns"] = stamps + 2_000_000_000
+        quest["host_monotonic_ns"] = (
+            stamps - stamps[0] + 6_000_000_000
+        )
         quest["sequence"] = np.arange(20, 20 + rows, dtype=np.int32)
         quest["pose_6d"] = pose
         quest["tracked"] = np.ones(rows, dtype=bool)
@@ -1804,7 +1831,34 @@ def test_quest_view(tmp_root: Path) -> None:
                 pose_source="controller",
                 pose_side="left",
             )
+            host_payload = load_quest_view(
+                opened,
+                100,
+                pose_source="controller",
+                pose_side="left",
+                alignment="host",
+                cap_unix_ns=int(stamps[0]),
+            )
+            auto_payload = load_quest_view(
+                opened,
+                100,
+                pose_source="controller",
+                pose_side="left",
+                alignment="auto",
+                cap_unix_ns=int(stamps[0]),
+            )
 
+    check(
+        "Quest 可视化/host 用主机接收时刻且 auto 会选中它",
+        host_payload is not None
+        and host_payload["alignment"] == "host"
+        and host_payload["time_source"] == "host_unix_ns"
+        and host_payload["time_based"] is True
+        and host_payload["time"][0] == 2.0
+        and auto_payload is not None
+        and auto_payload["alignment"] == "host",
+        str(host_payload and (host_payload["alignment"], host_payload["time"][:2])),
+    )
     check(
         "Quest 可视化/独立时间轴且明确未对齐",
         payload is not None
@@ -2054,7 +2108,7 @@ def test_quest_sequence_floor(tmp_root: Path) -> None:
 
 
 def test_start_gate() -> None:
-    """Selected-pose readiness/freeze + T3 abort; no hardware."""
+    """Sticky selected-pose readiness + T3 warn-only; no hardware."""
     import collect_cap
 
     now = [0.0]
@@ -2065,13 +2119,9 @@ def test_start_gate() -> None:
         watch.update(_pose_sample(index + 1, index * 0.001), now=now[0])
         now[0] += 0.008
     check(
-        "启动闸门/连续有效且位姿在变化 → 就绪",
-        watch.ready(
-            now=now[0],
-            required_samples=10,
-            fresh_s=READY_POSE_FRESH_S,
-        ),
-        f"consecutive={watch.consecutive_valid} age={watch.age_s(now[0]):.3f}",
+        "启动闸门/连续有效即就绪",
+        watch.ready(required_samples=10),
+        f"consecutive={watch.consecutive_valid}",
     )
 
     frozen = _pose_sample(11, 0.009)
@@ -2079,17 +2129,12 @@ def test_start_gate() -> None:
         watch.update(frozen, now=now[0])
         now[0] += 0.008
     check(
-        "启动闸门/位姿冻结 0.6 s → 不就绪",
-        not watch.ready(
-            now=now[0],
-            required_samples=10,
-            fresh_s=READY_POSE_FRESH_S,
-        ),
+        "启动闸门/位姿冻结 0.6 s 仍就绪（静止是合法数据）",
+        watch.ready(required_samples=10),
         f"age={watch.age_s(now[0]):.3f}",
     )
 
-    # Frozen from the very first sample: ten valid rows are not enough without
-    # an observed change.
+    # Frozen from the very first sample is still valid/tracked data.
     frozen_now = [0.0]
     frozen_watch = SelectedPoseWatch(
         "controller", "right", clock=lambda: frozen_now[0]
@@ -2100,46 +2145,19 @@ def test_start_gate() -> None:
         )
         frozen_now[0] += 0.008
     check(
-        "启动闸门/从未变化过的位姿不就绪",
-        not frozen_watch.ready(
-            now=frozen_now[0],
-            required_samples=10,
-            fresh_s=READY_POSE_FRESH_S,
-        ),
-        f"changes={frozen_watch.changes} last_change={frozen_watch.last_change}",
-    )
-
-    watch.mark_stale()
-    check(
-        "启动闸门/mark_stale 后旧位姿不算新鲜",
-        not watch.ready(
-            now=now[0],
-            required_samples=10,
-            fresh_s=READY_POSE_FRESH_S,
-        ),
-    )
-    watch.update(_pose_sample(12, 0.5), now=now[0])
-    check(
-        "启动闸门/mark_stale 后有变化才算新鲜",
-        watch.ready(
-            now=now[0],
-            required_samples=10,
-            fresh_s=READY_POSE_FRESH_S,
-        ),
+        "启动闸门/从未变化过的位姿也判就绪（valid/tracked 即可）",
+        frozen_watch.ready(required_samples=10),
+        f"changes={frozen_watch.changes}",
     )
 
     watch.update(_pose_sample(13, 0.5, tracked=False), now=now[0])
     check(
         "启动闸门/无效选定位姿清零连续计数",
         watch.consecutive_valid == 0
-        and not watch.ready(
-            now=now[0],
-            required_samples=10,
-            fresh_s=READY_POSE_FRESH_S,
-        ),
+        and not watch.ready(required_samples=10),
     )
 
-    # T3: samples keep arriving while the selected pose has not changed for 6 s.
+    # T3: a frozen selected pose only warns; it must not end the session.
     collect_cap.ABORT_REASON = None
     STOP_EVENT.clear()
     monitor = RuntimeMonitor(
@@ -2151,23 +2169,27 @@ def test_start_gate() -> None:
     for index in range(3):
         monitor.note_quest(_pose_sample(index + 1, index * 0.001))
     check(
-        "T3/选定位姿正常更新不中止",
-        collect_cap.ABORT_REASON is None,
+        "T3/选定位姿正常更新不告警",
+        monitor.pose_stale_warnings == 0,
     )
     assert monitor.pose_watch is not None
     monitor.pose_watch.last_change = time.monotonic() - 6.0
     monitor._next_process = 0.0
     monitor.poll()
     check(
-        "T3/选定位姿冻结 5 s 中止整场",
-        "选定位姿" in (collect_cap.ABORT_REASON or ""),
-        collect_cap.ABORT_REASON or "",
+        "T3/选定位姿冻结 6 s 只 warn、不中止",
+        collect_cap.ABORT_REASON is None
+        and not STOP_EVENT.is_set()
+        and monitor.pose_stale_warnings >= 1,
+        f"abort={collect_cap.ABORT_REASON!r} "
+        f"warnings={monitor.pose_stale_warnings}",
     )
     check(
-        "T3/冻结告警与最大冻结时长记账",
-        monitor.pose_stale_warnings >= 1 and monitor.pose_stale_max_s >= 5.0,
-        f"warnings={monitor.pose_stale_warnings} max={monitor.pose_stale_max_s}",
+        "T3/冻结最大时长记账",
+        monitor.pose_stale_max_s >= 5.0,
+        f"max={monitor.pose_stale_max_s}",
     )
+
     # A stale run warns once, not once per 1 Hz tick.
     collect_cap.ABORT_REASON = None
     STOP_EVENT.clear()
@@ -2187,11 +2209,11 @@ def test_start_gate() -> None:
     warn_monitor.poll()
     check(
         "T3/同一次冻结只告警一次",
-        warn_monitor.pose_stale_warnings == 1,
+        warn_monitor.pose_stale_warnings == 1
+        and collect_cap.ABORT_REASON is None,
         f"warnings={warn_monitor.pose_stale_warnings}",
     )
 
-    # abort_recording() set STOP_EVENT; the gate cases below start clean.
     collect_cap.ABORT_REASON = None
     STOP_EVENT.clear()
 

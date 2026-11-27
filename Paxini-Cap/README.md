@@ -40,8 +40,11 @@ Paxini-Cap/
 ## 0. 接手必读
 
 **当前状态**：真机（手套 + 双路相机 + Quest XRoboToolKit）已跑通；Quest 的 SDK
-时间戳已确认是**主机墙钟**，所以下游**默认就对 Quest 做对齐**（没有书面证据，报告里
-标 `clock_domain_verified=false`；要让时钟域有实证仍可跑 C8 走 `sdk_unix`）。
+时间戳约定为主机墙钟；新采集（format 5）另带 `quest/host_unix_ns` 主机接收时刻，
+下游**默认就对 Quest 做对齐**（`--quest-align auto` 用 host，不需要 C8；summary 标
+`alignment=host`、`clock_domain_verified=false`，因为 host 验证的是主机接收轴，不是
+SDK 时钟域）。老文件没有 host 列才回退 `unix`（同样标 false）；
+要让 SDK 时钟域有实证仍可跑 C8 走 `sdk_unix`。
 相机标定**已决定不做**（E8，下游扩散模型只吃图像、不解算位姿）；标定不做，任何
 "距离 / 位置 / 三维"的结论都不成立。逐项状态见 §6 与
 [`DOC/待验证清单.md`](DOC/待验证清单.md)。
@@ -74,8 +77,10 @@ Paxini-Cap/
 1. **采集端不做对齐。** 三条行轴 `cap/`(N) / `quest/`(Q) / `cameras/*`(M) 互相独立、
    行数永不相等，谁都不能当索引去切另一条。配对属于下游 `Paxini-Align/`。曾经有过
    一版对齐代码，已整体删除，别加回来。
-2. **只记 SDK 给的时间戳。** `cap/` 的 unix + monotonic 由 pxhandsdk 帧结构自带；
-   `quest/` 的四个由 `quest3.collect_sample` 取。不要补主机侧读数。
+2. **时间戳只记真实来源。** `cap/` 的 unix + monotonic 由 pxhandsdk 帧结构自带；
+   `quest/` 的四个 SDK 时间戳由 `quest3.collect_sample` 取；另外自 format 5 起
+   `quest/host_unix_ns` / `host_monotonic_ns` 记 **PC 接收时刻**（对齐用，不冒充设备
+   采样）。`cameras/` 的墙钟是 ffmpeg 打的。不要给手套或相机补别的主机侧读数。
 3. **分布力的 119 是坑位数，不是点数。** 每槽位按 `distribute_counts` 读，
    该值等于真正写进数组的点数。
 4. **回调线程只拷贝。** `snapshot_cap_frame` 跑在 SDK 线程里，只做 numpy 拷贝入队；
@@ -83,7 +88,7 @@ Paxini-Cap/
 5. **`quest3.py` 已与 `Dex_Quest/quest3.py` 分叉。** Cap 侧另有无线 ADB 配对/发现、
    `pc_service_command()` 等逻辑，Dex 侧没有；不要再追求两份一致。
 6. **`DOC/HDF5结构说明.md` 被用户手动编辑过**，只能定点修改，禁止整份重写。
-7. **改 `cap/` 或 `quest/` 的布局必须升 `format_version`**（当前 `4`），并在
+7. **改 `cap/` 或 `quest/` 的布局必须升 `format_version`**（当前 `5`），并在
    `HDF5结构说明.md` 的版本变更表里写清改了什么。下游按版本号判断怎么读。
 8. **相机只有 V4L2 一条路。** 不要把相机经 USB/IP 转发给虚拟机或容器：UVC 的等时包
    会被丢，720p 从 30 fps 掉到 5 fps；同理也不能让两路 720p30 挤在同一个 Hub 上。
@@ -326,7 +331,7 @@ pip install --ignore-installed -r requirements.txt
 
 | 缺口 | 状态 | 后果 |
 |---|---|---|
-| Quest 时间域 | 已确认是主机墙钟（**无书面证据**，C8 仍未跑） | 下游默认按 Unix 对齐，summary 标 `clock_domain_verified=false`；要实证就跑 C8 走 `sdk_unix` |
+| Quest 时间域 | SDK 戳约定为主机墙钟；新采集用 host 接收时刻（C8 仍未跑） | 下游默认 `auto` → host，summary 标 `alignment=host`、`clock_domain_verified=false`（C8 的 SDK 时钟域仍未验证）；老文件回退 `unix`（false）；要 SDK 实证就跑 C8 走 `sdk_unix` |
 | 相机标定 | **已划出范围**（E8） | 下游扩散模型只吃图像、不算位姿，因此不做。代价是不做任何"距离 / 位置 / 三维"结论 |
 | 手套零点标定 | 代码已有，无真机记录 | 关节角零点可能是偏的，默认阈值待 `info` 噪声底复核 |
 
@@ -339,10 +344,11 @@ pip install --ignore-installed -r requirements.txt
 1. **`Paxini-Align/`（已实现，2026-11-17）**：相机时间戳为采样网格，减去实测 Δ 后
    把手套流线性插值到该时刻，一行一个训练样本；输出 `aligned_<cam>.h5`，含取图用的
    `frame_index` 与插值跨度质量列。用法与字段见 [`Paxini-Align/README.md`](Paxini-Align/README.md)。
-   Quest **默认参与对齐**：`--quest-align unix` 把 SDK 戳直接当主机墙钟，取目标时刻
-   之前最近的一条整行复制，滞后逐行记在 `quest/age_ms`；没有 Quest 数据的采集自动跳过。
-   要时钟域实证就跑 C8 再走 `sdk_unix`。C8 解决时钟域，**不等于 Quest 采样链路延迟
-   已标定**。两路相机不同步，cam1 取前驱会有 0~一帧的滞后，要严格同帧就各跑一次。
+   Quest **默认参与对齐**：新采集 `--quest-align auto` 用 `quest/host_unix_ns`
+   主机接收时刻，老文件回退 `unix` 把 SDK 戳当主机墙钟；都取目标时刻之前最近的一条
+   整行复制，滞后逐行记在 `quest/age_ms`；没有 Quest 数据的采集自动跳过。要 SDK
+   时钟域实证就跑 C8 再走 `sdk_unix`。C8/host 都**不等于 Quest 采样链路延迟已标定**。
+   两路相机不同步，cam1 取前驱会有 0~一帧的滞后，要严格同帧就各跑一次。
 2. **相机延迟 Δ 现场实测**（不是标定，别混）：改分辨率、帧率、codec、USB 口、机器之后
    重跑 `latency/`，下游从台账取最近一次合格值。扩散模型对观测-动作错帧比人眼敏感得多，
    便宜但漏了要重采。

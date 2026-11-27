@@ -8,9 +8,10 @@ does. Policy for this project (2026-11-17):
 - Camera timestamps define the *sampling grid*: one output row per camera frame.
 - The glove stream (120 Hz) is resampled onto that 33 ms grid by linear
   interpolation between the two bracketing glove frames.
-- Quest is optional. When explicitly enabled with a passing C8 report, its SDK
-  Unix timestamps are mapped to host Unix and each camera target takes the last
-  valid Quest row at or before that instant. Missing or stale rows remain in the
+- Quest is optional. New captures carry host receive timestamps and are aligned
+  on that PC clock (``auto`` -> ``host``); old files fall back to ``unix`` or,
+  with a passing C8 report, use ``sdk_unix``. Each camera target takes the last
+  valid Quest row at or before the instant; missing or stale rows remain in the
   output with explicit invalid markers.
 - Camera latency delta is measured once per machine (``Cap_Quest/latency``) and
   subtracted from camera timestamps, because a camera timestamp is the moment the
@@ -49,17 +50,43 @@ ALIGNED_FORMAT_VERSION = 2
 #: 而产物每一列看起来都正常。
 DEFAULT_DELAY_MS = 0.0
 QUEST_ALIGNMENT_NONE = "none"
-#: SDK 时间戳已经确认就是主机墙钟，直接用，不要求 C8 报告。
+#: SDK 时间戳已经确认就是主机墙钟，直接用，不要求 C8 报告（老文件）。
 QUEST_ALIGNMENT_UNIX = "unix"
-#: 经 C8 报告的仿射模型换算到主机墙钟（更严谨，需要报告文件）。
+#: 经 C8 报告的仿射模型换算到主机墙钟（更严谨，需要报告文件；老文件）。
 QUEST_ALIGNMENT_SDK_UNIX = "sdk_unix"
+#: New captures carry `quest/host_unix_ns`: align on the PC receive time; no C8.
+QUEST_ALIGNMENT_HOST = "host"
+#: Use host when present, else fall back to unix (default for new captures).
+QUEST_ALIGNMENT_AUTO = "auto"
 QUEST_ALIGNMENT_CHOICES = (
     QUEST_ALIGNMENT_NONE,
+    QUEST_ALIGNMENT_AUTO,
     QUEST_ALIGNMENT_UNIX,
+    QUEST_ALIGNMENT_HOST,
     QUEST_ALIGNMENT_SDK_UNIX,
 )
-#: 需要真正处理 Quest 的模式。
-QUEST_ALIGNMENT_ACTIVE = (QUEST_ALIGNMENT_UNIX, QUEST_ALIGNMENT_SDK_UNIX)
+#: 需要真正处理 Quest 的模式（auto 会先按文件解析成 host/unix）。
+QUEST_ALIGNMENT_ACTIVE = (
+    QUEST_ALIGNMENT_UNIX,
+    QUEST_ALIGNMENT_HOST,
+    QUEST_ALIGNMENT_SDK_UNIX,
+)
+def resolve_quest_alignment(handle: Any, mode: str) -> str:
+    """Resolve ``auto`` from the file layout; other modes pass through.
+
+    The host column is the capability; ``format_version`` 5 documents it. Keying
+    on the column (not the version) keeps a hand-edited/partial old file safely
+    on the ``unix`` fallback.
+    """
+    if mode != QUEST_ALIGNMENT_AUTO:
+        return mode
+    return (
+        QUEST_ALIGNMENT_HOST
+        if "quest" in handle and "quest/host_unix_ns" in handle
+        else QUEST_ALIGNMENT_UNIX
+    )
+
+
 #: 四元数落在位姿末端的位数（x,y,z,qx,qy,qz,qw）。
 POSE_QUAT_TAIL = 4
 DEFAULT_QUEST_MAX_AGE_MS = 25.0
@@ -513,14 +540,23 @@ def align_quest_to_targets(
     of taking the previous row is a bounded lag, reported per row as ``age_ms``
     so downstream can filter on it exactly like ``glove/span_ms``.
 
-    Two clock paths:
+    Three clock paths:
 
-    * ``unix`` -- ``sdk_timestamp_ns`` is already host wall clock, use as-is.
+    * ``host`` -- use ``quest/host_unix_ns`` (new captures; PC receive time,
+      same clock as the camera/glove; no C8 report).
+    * ``unix`` -- ``sdk_timestamp_ns`` is already host wall clock, use as-is
+      (old files without host columns).
     * ``sdk_unix`` -- apply the affine model from a passing C8 report first.
     """
-    if "quest" not in handle or "quest/sdk_timestamp_ns" not in handle:
-        raise AlignError("请求 Quest 对齐，但 data.h5 里没有 quest/sdk_timestamp_ns")
-    raw = np.asarray(handle["quest/sdk_timestamp_ns"][:], dtype=np.int64)
+    mode = resolve_quest_alignment(handle, mode)
+    stamp_path = (
+        "quest/host_unix_ns"
+        if mode == QUEST_ALIGNMENT_HOST
+        else "quest/sdk_timestamp_ns"
+    )
+    if "quest" not in handle or stamp_path not in handle:
+        raise AlignError(f"请求 Quest 对齐，但 data.h5 里没有 {stamp_path}")
+    raw = np.asarray(handle[stamp_path][:], dtype=np.int64)
     quality = quest_timestamp_quality(raw, _quest_poll_rate_hz(handle))
 
     limits = (clock_report or {}).get("thresholds") or {}
@@ -532,7 +568,7 @@ def align_quest_to_targets(
     failures: list[str] = []
     warnings: list[str] = []
     if quality["unique_count"] < 1:
-        failures.append("没有任何有效 SDK 时间戳")
+        failures.append("没有任何有效 Quest 时间戳")
     if quality["backwards_steps"] > max_backwards:
         failures.append(f"时间戳倒退 {quality['backwards_steps']} 次，时间轴非单调")
     max_run_s = float(limits.get("max_same_timestamp_run_s", 1.0))
@@ -542,11 +578,11 @@ def align_quest_to_targets(
     )
     if quality["max_same_timestamp_run_s"] > max_run_s:
         # 拉取模型下重复是常态。sdk_unix 有 C8 报告背书，超限即判失败；
-        # unix 模式只提示——重复不破坏「同一条时间轴」这个前提。
+        # host/unix 模式只提示——重复不破坏「同一条时间轴」这个前提。
         (failures if mode == QUEST_ALIGNMENT_SDK_UNIX else warnings).append(repeated)
-    # 源文件里「时间戳非 -1 的行占比」只对 sdk_unix 有意义：那条路要求整份文件的
-    # 时间戳质量达到 C8 报告阈值。unix 模式不做这个判断——配对时逐行跳过无效行，
-    # 缺的那部分自然表现为 quest/valid=false，再报一个比例纯属噪音。
+    # Only sdk_unix hard-gates source coverage (the C8 path). host is a
+    # measured PC clock: missing rows simply become quest/valid=false, and
+    # unix is a convention with the same per-row semantics.
     if (
         mode == QUEST_ALIGNMENT_SDK_UNIX
         and quality["valid_source_fraction"] < min_valid_fraction
@@ -579,7 +615,7 @@ def align_quest_to_targets(
     if "quest/pose_6d" in handle:
         pose = np.asarray(handle["quest/pose_6d"][:], dtype=np.float64)
         if pose.shape[0] != raw.size or pose.ndim != 2 or pose.shape[1] < 3:
-            raise AlignError("quest/pose_6d 形状与 sdk_timestamp_ns 不匹配")
+            raise AlignError(f"quest/pose_6d 形状与 {stamp_path} 不匹配")
         position_finite = np.isfinite(pose[:, :3]).all(axis=1)
         keep_pose = position_finite[stamp_indices]
         pose_excluded = int(stamp_indices.size - np.count_nonzero(keep_pose))
@@ -625,38 +661,41 @@ def align_quest_to_targets(
     valid = has_candidate & (age_ms >= 0.0) & (age_ms <= float(max_age_ms))
     selected[~valid] = -1
     selected_host[~valid] = -1
-    selected_sdk = np.full(targets.shape, -1, dtype=np.int64)
-    if np.any(valid):
-        selected_sdk[valid] = valid_raw[positions[valid]]
-
     valid_age = age_ms[valid]
+    age_stats = {
+        "median": float(np.median(valid_age)) if valid_age.size else None,
+        "p95": float(np.percentile(valid_age, 95)) if valid_age.size else None,
+        "p99": float(np.percentile(valid_age, 99)) if valid_age.size else None,
+        "max": float(np.max(valid_age)) if valid_age.size else None,
+    }
+    sdk_all = (
+        np.asarray(handle["quest/sdk_timestamp_ns"][:], dtype=np.int64)
+        if "quest/sdk_timestamp_ns" in handle
+        else np.full(raw.size, -1, dtype=np.int64)
+    )
+    timestamp_sdk_ns = np.full(targets.shape, -1, dtype=np.int64)
+    if np.any(valid):
+        timestamp_sdk_ns[valid] = sdk_all[selected[valid]]
     return {
         "enabled": True,
         "mode": mode,
         "target_clock": "host_unix_ns",
         "source_rows": int(raw.size),
-        "max_age_ms": float(max_age_ms),
+        "valid_rows": int(valid_indices.size),
+        "pose_excluded_rows": int(pose_excluded),
         "index": selected,
         "valid": valid,
         "age_ms": age_ms,
-        "timestamp_sdk_ns": selected_sdk,
+        "age_stats_ms": age_stats,
+        "timestamp_sdk_ns": timestamp_sdk_ns,
         "timestamp_host_unix_ns": selected_host,
-        "quality": quality,
-        "quality_warnings": warnings,
-        "pose_excluded_rows": pose_excluded,
-        "clock_report_sha256": report_sha256,
-        "clock_model": model,
         "paired_rows": int(np.count_nonzero(valid)),
-        # 命名要能自证：这是「多少相机行配到了样本」，不是源文件的时间戳有效率。
-        "paired_fraction": (
-            float(np.count_nonzero(valid)) / targets.size if targets.size else 0.0
-        ),
-        "age_stats_ms": {
-            "median": float(np.median(valid_age)) if valid_age.size else None,
-            "p95": float(np.percentile(valid_age, 95)) if valid_age.size else None,
-            "p99": float(np.percentile(valid_age, 99)) if valid_age.size else None,
-            "max": float(np.max(valid_age)) if valid_age.size else None,
-        },
+        "paired_fraction": float(np.count_nonzero(valid) / max(targets.size, 1)),
+        "max_age_ms": float(max_age_ms),
+        "quality": quality,
+        "quality_warnings": list(warnings),
+        "clock_report_sha256": report_sha256 if mode == QUEST_ALIGNMENT_SDK_UNIX else None,
+        "clock_model": model,
     }
 
 
@@ -671,14 +710,20 @@ def quest_valid_window(
     ``sdk_unix`` maps them through the C8 model first. Anything else opt-in
     needs a model, so an absent report yields no window.
     """
-    if "quest/sdk_timestamp_ns" not in handle:
+    mode = resolve_quest_alignment(handle, mode)
+    stamp_path = (
+        "quest/host_unix_ns"
+        if mode == QUEST_ALIGNMENT_HOST
+        else "quest/sdk_timestamp_ns"
+    )
+    if stamp_path not in handle:
         return None
     model: dict[str, Any] | None = None
     if mode == QUEST_ALIGNMENT_SDK_UNIX:
         model = (clock_report or {}).get("models", {}).get("host_unix")
         if not isinstance(model, dict):
             return None
-    raw = np.asarray(handle["quest/sdk_timestamp_ns"][:], dtype=np.int64)
+    raw = np.asarray(handle[stamp_path][:], dtype=np.int64)
     valid = raw[raw > 0]
     if valid.size == 0:
         return None
@@ -720,6 +765,14 @@ def align_recording(
     with closing(open_recording(recording, clear_flag)) as handle:
         if "cap" not in handle:
             raise AlignError("data.h5 里没有 cap/ 组，不是本工程的采集文件")
+        # ``auto`` is file-dependent: new captures have host receive columns,
+        # old ones only have the SDK stamps.
+        quest_alignment = resolve_quest_alignment(handle, quest_alignment)
+        if quest_alignment in QUEST_ALIGNMENT_ACTIVE:
+            if not np.isfinite(quest_max_age_ms) or quest_max_age_ms < 0:
+                raise AlignError("Quest 最大年龄必须是有限的非负数")
+            if not 0.0 <= quest_min_valid_fraction <= 1.0:
+                raise AlignError("Quest 最小有效比例必须在 0..1")
         slots = camera_slots(handle)
         if not slots:
             raise AlignError("data.h5 里没有 cameras/ 组：这份采集没录视频，无法确定采样网格")
@@ -795,9 +848,14 @@ def align_recording(
         # 一行只算给第一个排除它的来源。
         # 默认就对 Quest 做对齐，所以「配了但这份文件没有 Quest」必须自动跳过，
         # 否则 --no-quest 采的每一份都会在批量里报错。
+        quest_stamp_path = (
+            "quest/host_unix_ns"
+            if quest_alignment == QUEST_ALIGNMENT_HOST
+            else "quest/sdk_timestamp_ns"
+        )
         quest_rows_available = (
-            int(handle["quest/sdk_timestamp_ns"].shape[0])
-            if "quest/sdk_timestamp_ns" in handle
+            int(handle[quest_stamp_path].shape[0])
+            if quest_stamp_path in handle
             else 0
         )
         quest_active = (
@@ -806,9 +864,9 @@ def align_recording(
         quest_skipped_reason: str | None = None
         if quest_alignment in QUEST_ALIGNMENT_ACTIVE and not quest_active:
             quest_skipped_reason = (
-                "data.h5 里没有 quest/sdk_timestamp_ns 数据集"
-                if "quest/sdk_timestamp_ns" not in handle
-                else "quest/sdk_timestamp_ns 是 0 行（采集时没拿到样本）"
+                f"data.h5 里没有 {quest_stamp_path} 数据集"
+                if quest_stamp_path not in handle
+                else f"{quest_stamp_path} 是 0 行（采集时没拿到样本）"
             )
 
         windows: dict[str, dict[str, int]] = {}
@@ -1209,7 +1267,8 @@ def aligned_summary(result: dict[str, Any]) -> dict[str, Any]:
             },
             "source_timestamp_quality": quest["quality"],
             "quality_warnings": list(quest["quality_warnings"]),
-            "clock_domain_verified": quest["mode"] == QUEST_ALIGNMENT_SDK_UNIX,
+            "clock_domain_verified": quest["mode"]
+            == QUEST_ALIGNMENT_SDK_UNIX,
             "clock_report_sha256": quest["clock_report_sha256"],
         }
     elif result.get("quest_alignment") in QUEST_ALIGNMENT_ACTIVE:
@@ -1308,6 +1367,10 @@ def report(result: dict[str, Any], path: Path | None, delay_source: str) -> None
             log(
                 "    （unix 模式：SDK 时间戳直接当主机墙钟用，未做 C8 时钟域验证）"
             )
+        elif quest["mode"] == QUEST_ALIGNMENT_HOST:
+            log(
+                "    （host 模式：用采集时记录的主机接收时刻对齐，不需要 C8 报告）"
+            )
         if quest["quality_warnings"]:
             for message in quest["quality_warnings"]:
                 warn(f"  Quest 时间戳质量提示：{message}")
@@ -1399,11 +1462,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quest-align",
         choices=QUEST_ALIGNMENT_CHOICES,
-        default=QUEST_ALIGNMENT_UNIX,
+        default=QUEST_ALIGNMENT_AUTO,
         help=(
-            "默认 unix=SDK 时间戳就是主机墙钟，直接对齐（不需要 C8 报告）；"
-            "sdk_unix=先按 C8 报告的时钟模型换算；none=不处理 Quest。"
-            "文件里没有 Quest 数据时自动跳过，不报错"
+            "默认 auto=有 quest/host_unix_ns 用主机接收时刻（新采集，不需要 "
+            "C8 报告），没有则回退 unix（老文件）；host=强制主机接收时刻；"
+            "unix=把 SDK 戳当主机墙钟；sdk_unix=按 C8 报告换算；"
+            "none=不处理 Quest。文件里没有 Quest 数据时自动跳过，不报错"
         ),
     )
     parser.add_argument(
@@ -1425,7 +1489,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Quest 有效配对比例门槛，默认 "
             f"{DEFAULT_QUEST_MIN_VALID_FRACTION:g}；仅 sdk_unix 模式生效"
-            "（未达标即不写输出文件），unix 模式忽略"
+            "（未达标即不写输出文件），host/unix 模式忽略"
         ),
     )
     return parser
@@ -1453,7 +1517,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         warn(
             "给了 --quest-clock-report 但 --quest-align 不是 sdk_unix，报告不会被使用"
-            "（unix 模式不需要 C8 验证）"
+            "（host/unix 模式不需要 C8 验证）"
         )
     quest_report = None
     quest_report_sha256 = None

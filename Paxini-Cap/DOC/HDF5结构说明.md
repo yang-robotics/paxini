@@ -29,6 +29,8 @@ data.h5
 │   ├── body_timestamp_ns                 (Q,)            int64
 │   ├── motion_timestamp_ns               (Q,)            int64
 │   ├── body_joints_timestamp_ns          (Q,24)          int64
+│   ├── host_unix_ns                      (Q,)            int64   PC 接收时刻
+│   ├── host_monotonic_ns                 (Q,)            int64   PC 接收时刻
 │   ├── sequence                          (Q,)            int32
 │   ├── pose_6d                           (Q,7)           float64
 │   ├── tracked                           (Q,)            bool
@@ -160,6 +162,8 @@ print("跳变次数:", jumps.size, "位置(行号):", jumps[:5].tolist())
 | `body_timestamp_ns`                  | (Q,)     | int64   | `get_body_timestamp_ns()`；没给则 -1                                |
 | `motion_timestamp_ns`                | (Q,)     | int64   | `get_motion_timestamp_ns()`；没给则 -1                              |
 | `body_joints_timestamp_ns`           | (Q,24)   | int64   | `get_body_joints_timestamp()`，24 个关节各一个；缺失补 -1                  |
+| `host_unix_ns`                       | (Q,)     | int64   | **主机接收时刻**（PC 墙钟，`collect_sample` 前后中点）；与相机/手套同一把尺；不是设备采样时刻 |
+| `host_monotonic_ns`                  | (Q,)     | int64   | 同一瞬间的主机单调钟；算行间隔/频率，免疫 NTP                               |
 | `sequence`                           | (Q,)     | int32   | 轮询序号，连续；跳号说明丢样本                                                 |
 | `pose_6d`                            | (Q,7)    | float64 | 选定的主位姿 `x,y,z,qx,qy,qz,qw`                                      |
 | `tracked`                            | (Q,)     | bool    | 任一路是否被追踪                                                        |
@@ -177,9 +181,12 @@ print("跳变次数:", jumps.size, "位置(行号):", jumps[:5].tolist())
 （`+X` 右、`+Y` 上、`+Z` 前，左手系）。时间对齐不等于空间外参已标定——**标定功能目前
 不存在**，`tracking-origin` 到相机/手套的变换还没有，见 [`标定.md`](标定.md) §2。
 
-**四列时间戳都是 SDK 给的，我们不再追加主机侧读数。** 代价是：官方 docstring 只有
-一句 "Get the timestamp in nanoseconds."，**没写起点和基准**，所以在这四个值的时钟域
-被证实之前，不能拿它们直接和手套的单调钟相减。验证方法见
+**四列 SDK 时间戳原样保留；另有两列主机接收时刻用于对齐（format_version 5 起）。**
+官方 docstring 只有一句 "Get the timestamp in nanoseconds."，**没写起点和基准**；所以
+`sdk_timestamp_ns` 不能直接和手套的单调钟相减。`host_unix_ns` 是 PC 收到这一条样本时
+的墙钟，和相机/手套同一侧；它不冒充头显采样时刻（头显→PC 的传输延迟仍在）。下游用
+`--quest-align host`（新采集默认 `auto` 会选它）直接对齐，不再需要 C8 报告；老文件没有
+这两列，仍走 `unix` / `sdk_unix`。验证 SDK 时钟域的方法见
 [`待验证清单.md`](待验证清单.md)。
 
 ---
@@ -208,8 +215,8 @@ Recordings/data_20261111_1/          # 在 Paxini-Cap 根下，不在 Cap_Quest 
 现在只写第一列。**没有 `frame_index`、没有 `skew_ns`**——配对在采集端已经全部移除。
 
 这一列的来源是主机侧（V4L2 驱动 / ffmpeg），
-**不是某个 SDK**：它没法由 SDK 提供，删了视频就没有任何时间轴可用。这是"只记 SDK
-时间戳"规则唯一的例外，写在这里以免误解。
+**不是某个 SDK**：它没法由 SDK 提供，删了视频就没有任何时间轴可干。相机时间戳和
+`quest/host_*` 是"只记 SDK 时间戳"规则的两类例外，都写在这里以免误解。
 
 ### 5.1 为什么相机时间戳只能是墙钟
 
@@ -231,7 +238,7 @@ V4L2 驱动在每次出帧的 `v4l2_buffer.flags` 里声明时钟类型（`TIMES
 
 | 属性                             | 内容                                                                            |
 | ------------------------------ | ----------------------------------------------------------------------------- |
-| `format_version`               | 结构版本，当前 `4`                                                                   |
+| `format_version`               | 结构版本，当前 `5`                                                                   |
 | `started_at` / `ended_at`      | **按键开始**的本地时区 ISO 时间 / manifest 写出时刻                                   |
 | `session`                      | 按键时刻 `started_at` / `started_unix_ns` / `started_monotonic_ns`、`ready_wait_s`、`key_wait_s`、`auto_start`、待机丢弃数 |
 | `rows` / `quest_rows`          | `N` / `Q`（都不含待机期）                                                             |
@@ -240,7 +247,7 @@ V4L2 驱动在每次出帧的 `v4l2_buffer.flags` 里声明时钟类型（`TIMES
 | `alignment`                    | 固定为 `none (raw per-source timestamps only)`                                   |
 | `pose`                         | 主位姿来源、分量顺序、坐标系说明                                                              |
 | `hand`                         | 单只手套手别 `side`、Quest 请求手别 `pose_side_requested`、串口、SN、SDK/固件版本、故障、回调耗时、队列溢出、`standby_frames_discarded` |
-| `quest`                        | `enabled`、`errors`、`timestamp_source`、`timestamp_fields`、`rows`、`valid_rows`（已写入行里的有效行）、`first_sequence` / `last_sequence`、`standby_samples_discarded`、`selected_pose`（判据、待机/运行期变化、`stale_max_s`、`stale_warnings`）、`samples_dropped`、`poller_alive`、轮询次数与 `poller_overruns` |
+| `quest`                        | `enabled`、`errors`、`timestamp_source`（`sdk_provided + host_receive`）、`timestamp_fields`、`host_receive_fields`、`rows`、`valid_rows`（已写入行里的有效行）、`first_sequence` / `last_sequence`、`standby_samples_discarded`、`first/last_host_unix_ns`、`first/last_host_monotonic_ns`、`selected_pose`（判据、待机/运行期变化、`stale_max_s`、`stale_warnings`）、`samples_dropped`、`poller_alive`、轮询次数与 `poller_overruns` |
 | `cameras`                      | `backend`（固定 `linux`）、每路设备节点、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s`（`camera.start()`→首帧）、`pre_roll_s`（首帧→按键） |
 | `runtime`                      | `abort_reason`（中止原因，正常结束为 null）、`configured_sources`、检查频率与停滞阈值（含 `quest_valid_*`、`quest_pose_*`）、`camera_stalls`、`glove_stalls` |
 | `verify`                       | 行数自检结果（`row_mismatch` 必须为空）                                                   |
@@ -335,7 +342,8 @@ cameras/right_cam0      row 0
 
 | 版本 | 变化 |
 |---|---|
-| **4**（当前） | `cameras/<id>/` 曾新增可选的 `timestamp_monotonic_ns`（与 `cap/timestamp_monotonic_ns` 同域的单调钟列）；现在的采集端不再写它，但 2026-11-17 及更早的文件里可能存在。`meta.cameras.per_camera.<id>` 同步多了 `monotonic_available` |
+| **5**（当前） | `quest/` 新增 `host_unix_ns` / `host_monotonic_ns`（主机接收时刻，对齐用；不是设备采样）。旧文件 4 没有这两列，仍可按 `unix`/`sdk_unix` 读 |
+| 4 | `cameras/<id>/` 曾新增可选的 `timestamp_monotonic_ns`（与 `cap/timestamp_monotonic_ns` 同域的单调钟列）；现在的采集端不再写它，但 2026-11-17 及更早的文件里可能存在。`meta.cameras.per_camera.<id>` 同步多了 `monotonic_available` |
 | 3 | 时间戳只保留 SDK 给的：`cap/` 删掉 `received_monotonic_ns`；`quest/` 的三列主机时间戳（`host_poll_start_ns`/`host_poll_end_ns`/`host_timestamp_ns`）换成四列 SDK 时间戳（`sdk_`/`body_`/`motion_`/`body_joints_timestamp_ns`） |
 | 2 | 删除采集端全部对齐：`cameras/*/frame_index`、`cameras/*/skew_ns`、`quest/available`、`quest/skew_ns`；`quest/` 改成自己的行轴 `Q` |
 | 1（废弃） | 采集时就做最近邻配对，`quest` 与 `cap` 同为 N 行 |
@@ -345,6 +353,7 @@ cameras/right_cam0      row 0
 对齐逻辑本身没有删除，只是搬到下游处理工程（现有 `Paxini-Align/`）。那边需要的
 输入这里都有：`cap` 的两个 SDK 时间戳、`quest` 的四个 SDK 时间戳、`cameras` 的墙钟。
 
-下游**默认就对 Quest 做对齐**（`--quest-align unix`，把 SDK 戳当主机墙钟用，不要求
-C8 报告）；只有 `--quest-align sdk_unix` 这条路才需要 C8 报告与文件级时间戳质量双重
-门控。没有 Quest 数据时自动跳过。
+下游**默认就对 Quest 做对齐**（`--quest-align auto`）：新版有 `quest/host_unix_ns`
+就用主机接收时刻（不要求 C8 报告）；老文件没有这两列才回退 `unix`（把 SDK 戳当主机
+墙钟）。`--quest-align sdk_unix` 这条路才需要 C8 报告与文件级时间戳质量双重门控。
+没有 Quest 数据时自动跳过。

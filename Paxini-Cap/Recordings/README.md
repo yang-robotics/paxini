@@ -17,12 +17,19 @@
 
 四份的行数、频率、时长与各自的 `manifest.json` 逐项核对一致（2026-11-20，按
 `manifest.rows` / `actual_rate_hz` / `duration_s` 读，不按目录名猜）；`data.h5` 均为
-`format_version=4`，可直接喂 [`../Paxini-Align/align_capture.py`](../Paxini-Align/align_capture.py)。
+`format_version=4`，可直接喂 [`../Paxini-Align/align_capture.py`](../Paxini-Align/align_capture.py)。**2026-11-27 起新采集是 format 5**（`quest/` 多 `host_unix_ns`/`host_monotonic_ns`），老 4 文件没有这两列、Align 会自动回退 `unix`。
 
 **四份都没有 Quest 行**（`quest_rows=0`、`quest.enabled=false`）。表格早先给三份
 20261117 样例标过「有」，那是因为 `data.h5` 里有空的 `quest/` 组——组在、行是 0，
 不等于采到了数据；C8 与 Quest 对齐在这批数据上无从验证（下游默认对齐遇到这类文件会
 自动跳过，不会报错）。
+
+## 启动失败工件（2026-11-27 起）
+
+启动失败/启动错误**不再**在 `Recordings/` 里留 `data_*` 目录：诊断写到
+`Recordings/_startup_failures/<时间戳>_<原因>/`（`startup_failure.json` + 每路相机
+`cameras/*.log` + 完整 ffmpeg 命令；预录 mkv 不保留）。`data_*` 目录只放成功采集；
+待机期按 Ctrl+C 会删掉本次输出目录、只在日志说明，不产生失败工件。
 
 ## 已知限制
 

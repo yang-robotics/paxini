@@ -260,24 +260,28 @@ Ctrl+C 正好落在一次批量写中间，`RLock` 会让同一线程重入成�
 **根因**：右手柄休眠/丢追踪，APK 继续把最后一帧 pose 发上来。`quest/tracked` 是
 「头显 OR 手柄 OR 手部」的或，头显还在，所以整段都是 true；SDK 没有
 `get_right_controller_is_active` 之类的接口，`pose_info.tracked` 只看四元数模长，
-冻结的四元数模长仍是 1。**只有值本身能识别冻结**。
+冻结的四元数模长仍是 1。**值本身也无法可靠区分**：静止的手和休眠的手柄都可能是逐位
+相同，SDK 又没有 per-controller tracked 接口，所以不要拿它做硬中止判据。
 
-**已修（2026-11-27）**：`SelectedPoseWatch` 看选定位姿的 7 个数；就绪要求 0.5 s 内有变化，
-录制期连续 5 s 不变即 `abort_recording`（1 s 先 warn）。manifest 记
-`quest.selected_pose.stale_max_s` / `stale_warnings`。
+**已修（2026-11-27）**：`SelectedPoseWatch` 看选定位姿的 7 个数，但只用于诊断：就绪不再
+要求位姿变化，录制期 1 s 未变化只 warn、不中止（静止是合法数据；SDK 没有
+per-controller tracked 接口）。manifest 记 `quest.selected_pose.stale_max_s` /
+`stale_warnings`。
 
 ### Quest 时间戳整体比主机 Unix 快约 2.55 s
 
 **现象**：`data_20261127_4` / `_2` 的 `quest/sdk_timestamp_ns` 与主机 Unix 的差恒定
-**+2.55 / +2.56 s**，30 s 内不漂。默认 `--quest-align unix` 把 sdk 当主机墙钟，于是
+**+2.55 / +2.56 s**，30 s 内不漂。老文件的 `--quest-align unix` 把 sdk 当主机墙钟，于是
 Quest 整体放晚 2.55 s：开头 2.55 s 相机没有 Quest，末尾多出一截。
 
 **根因**：SDK 给的是头显时钟，不是这台主机的墙钟；C8 从未跑过。这不是「多一段待机
 数据」，起点闸门也修不了它。
 
-**对策**：跑 `diagnostics/quest_clock_probe.py`（重复判据 2026-11-27 起按持续时长，
-120 Hz 轮询不再误杀），拿通过的报告走 `--quest-align sdk_unix`。只看原始 `data.h5` 的
-sdk 列，偏移永远在；要么接受，要么走 C8。
+**对策**：**format 5 起新采集自带 `quest/host_unix_ns`/`host_monotonic_ns`**，Align
+默认 `--quest-align auto` 直接用主机接收时刻，不再有这个问题。老文件没有这两列，才跑
+`diagnostics/quest_clock_probe.py`（重复判据按持续时长，120 Hz 轮询不再误杀）拿通过
+的报告走 `--quest-align sdk_unix`。只看原始 `data.h5` 的 sdk 列，偏移永远在；要么接受，
+要么走 C8。
 
 ## 四、重构相关的坑（2026-11-16 目录拆分后）
 

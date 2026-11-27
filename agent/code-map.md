@@ -42,7 +42,7 @@
 | Quest 无线 ADB | `capture/quest3.py` | `parse_mdns_services()`、`pair_and_connect()`、`--pair/--wireless` | `selftest` 的 "无线 ADB" 组；真机 `quest3.py --pair` |
 | Quest C8 时钟探针 | `diagnostics/quest_clock_probe.py` | `run_probe()`、`evaluate_clock_samples()` | `selftest` 的 "C8 探针" 组；重复判据按持续时长（默认 1 s），产物落 `clock_probe/` |
 | 回放窗口 | `viewer/visualize.py` | `collect_payload()`(:380) → `run_window()`(:549) / `write_viewer()`(:966) | `--save-png` 出一张 |
-| Quest 回放 payload | `viewer/quest_view.py` | `load_quest_view()`(:161)、`load_clock_report()`(:115)、`take_evenly()`(:26) | `selftest` 的 "Quest 可视化"；默认按 Unix 轴对齐，`none` 才独立轴 |
+| Quest 回放 payload | `viewer/quest_view.py` | `load_quest_view()`(:161)、`load_clock_report()`(:115)、`take_evenly()`(:26) | `selftest` 的 "Quest 可视化"；默认 auto（新采集 host，老文件 unix），`none` 才独立轴 |
 | 回放视频预览 | `viewer/visualize.py` | `build_preview()`(:302) | `selftest` 的 "视频" 组 |
 | 分布力空间散点图 | `viewer/visualize.py` + `viewer/sensor_layout_schematic.py` | `build_slot_force()` 的 `dist`、`drawDistribution()`；无本地 Studio 模型时用示意网格，切向箭头用 `dist.tangent` | `selftest` 的 "可视化分布力" / "示意布局" 组 |
 | 实时视图 | `viewer/live_view.py` | `HtmlLiveView`(:773) / `LiveView`(:920) | `--view` 起一次 |
@@ -63,7 +63,7 @@
 | 改 Quest 对齐 | `Paxini-Align/align_capture.py` | `load_quest_clock_report()`(:88)、`align_quest_to_targets()`(:470)、`write_quest_alignment()`(:1007) | `selftest.py` 的默认对齐、整行取前驱、滞后范围、无数据跳过、选样 tie-break、C8 硬门控；同步 Align README |
 
 对齐层**只读** `data.h5`，绝不回写；改这里不会影响采集端，但改了输出布局要升
-`ALIGNED_FORMAT_VERSION`（当前 2，与采集端的 4 无关）。
+`ALIGNED_FORMAT_VERSION`（当前 2，与采集端的 5 无关）。
 
 ## 关键常量（写代码前先看这几个）
 
@@ -77,7 +77,7 @@
 | `HAND_SIDES` | `("left", "right")` | 单只手套手别；Quest 默认跟随 |
 | `FLUSH_ROWS` | `100` | 攒够 100 行才 resize+赋值，120 Hz 下约 0.83 s |
 | `SESSION_START_TOLERANCE_S` | `5.0` | 三源时间窗粗检阈值，只告警不纠正 |
-| `format_version` | `4` | 改 `cap/` 或 `quest/` 布局必须升 |
+| `format_version` | `5` | 改 `cap/` 或 `quest/` 布局必须升 |
 
 **最容易记错的一条**：444 是全部槽位加起来，`CAP_MAX_POINTS` 是单个槽位的上限 119。
 把 119 当成总点数会写越界；把 444 当成每槽位会分配 4 倍内存。

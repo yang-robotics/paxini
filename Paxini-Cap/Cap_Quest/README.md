@@ -103,8 +103,8 @@ Quest      由 --no-quest 决定。装配失败（PC Service / ADB / SDK）→ �
 待机顺序（`StartGate`）：
 
 1. Quest poller 与手套连续采集先跑起来；
-2. 等到 `--quest-ready-samples` 条**选定位姿**连续有效，且最近 0.5 s 内位姿有变化
-   （防手柄休眠/冻结），同时手套真实出帧；
+2. 等到 `--quest-ready-samples` 条**选定位姿**连续有效，同时手套真实出帧；
+   位姿静止不会撤回就绪（静止是合法数据）；
 3. 这时才 `camera.start()`，等每路首帧（`--camera-start-timeout` 默认 15 s，实测 1–2.5 s）；
 4. 终端打印「准备完毕」，等你按**任意一个键**（不用回车）；
 5. 按键才创建 `data.h5`、清空 Quest/手套的待机缓冲、开始写行；相机继续录。
@@ -116,7 +116,7 @@ Quest      由 --no-quest 决定。装配失败（PC Service / ADB / SDK）→ �
 - **相机 mkv 有按键前的预录**（相机先起是历史行为，也是“就绪=真的出图”的代价）。
   `manifest.cameras.per_camera.<id>.pre_roll_s` 记这段长度；下游 Align 按公共窗口
   丢掉，不影响对齐产物。
-- `data.h5` 只在按键后创建；待机期按 Ctrl+C 写 `startup_failure.json`，不会生成空 HDF5。
+- `data.h5` 只在按键后创建；待机期按 Ctrl+C **删掉本次输出目录、只在日志说明**，不会生成 `data_*` 空目录或失败工件。
 - 非 TTY（nohup/管道）必须加 `--no-wait`（就绪后自动开始），否则启动前直接报错。
 - `--duration` 从按键那刻开始计时。
 
@@ -128,7 +128,7 @@ Quest      由 --no-quest 决定。装配失败（PC Service / ADB / SDK）→ �
 | 相机出帧 | **0.5 Hz** | 启动宽限（`--camera-start-timeout`，15 s）过后 4 s 进度不增长；从没出过帧也走这一条 | 中止整场 |
 | Quest 轮询 | 1 Hz | `failure` 非空；或 5 s 内 `samples` 不增长（线程卡在 SDK 调用里） | 中止整场 |
 | Quest 数据有效性 | 1 Hz | 启动 10 s 宽限后 `valid_samples` 仍为 0；或出过有效数据后 5 s 不更新 | 中止整场 |
-| **Quest 选定位姿冻结** | 1 Hz | 选定位姿连续 **5 s** 逐位不变（手柄休眠/丢追踪）；**1 s 先 warn** | 中止整场 |
+| **Quest 选定位姿冻结** | 1 Hz | 选定位姿连续 **1 s** 逐位不变；**只 warn**（静止是合法数据，SDK 没有 per-controller tracked 接口） | 记 manifest，不中止 |
 | 手套出帧 | 每帧记时刻 | 连续 3 s 无新帧（没有宽限期） | 中止整场 |
 
 中止不是崩溃：走 `abort_recording()` → `STOP_EVENT` → 正常收尾（排空队列、停相机、
@@ -150,9 +150,10 @@ Quest      由 --no-quest 决定。装配失败（PC Service / ADB / SDK）→ �
 `--pose-side left|right` 覆盖。选择手别只影响 provenance 和相机命名，手套原始字段
 原样保存，不做镜像或符号转换。
 
-启动在创建 `data.h5` 之前失败时，程序保留本次目录并写
-`startup_failure.json`，同时保留 `cameras/*.log`、完整 ffmpeg 命令和日志末尾；
-不会生成伪造 HDF5。若 `--output-dir` 原本已存在，诊断写到旁边的新目录，不污染旧数据。
+启动在创建 `data.h5` 之前失败时，程序把诊断写到
+`Recordings/_startup_failures/<时间戳>_<原因>/`：`startup_failure.json` + 每路相机
+`cameras/*.log` + 完整 ffmpeg 命令和日志末尾；`data_*` 目录和预录 mkv 会被清掉，
+不会生成伪造 HDF5，也不会占 `data_*` 编号。`--output-dir` 原本已存在时不删除用户目录。
 
 #### 没有一键脚本（2026-11-20 起）
 
@@ -230,12 +231,15 @@ sudo timedatectl set-ntp false      # 采完再 set-ntp true
 其余字段把整个样本都存下来，不受 `--pose-source` 影响。**一次轮询 = 一行**，
 没采到就是没有这一行。
 
-四列时间戳都是 SDK 给的，我们不再追加主机侧读数。因为 `sdk_timestamp_ns` 的
-时钟域官方没写，所以不能直接和手套的单调钟相减——先验证域，再谈对齐。
+四个 SDK 时间戳原样保留；**自 format_version 5 起** `quest/` 另有
+`host_unix_ns` / `host_monotonic_ns` 两列：`QuestPoller` 在
+`XrtReader.collect_sample()` 前后各读一次主机钟、取中点写行，表示**这条样本在 PC 上
+可用的时刻**（与相机/手套同一把尺，不冒充头显采样时刻）。下游 Align 用
+`--quest-align host`（新采集默认 `auto` 会选它）直接对齐，不需要 C8 报告；老文件没有
+这两列，仍走 `unix` / `sdk_unix`。
 
-四个值连同位姿、按键一起在 `quest3.py` 的 `XrtReader.collect_sample()` 里取好并
-返回；`collect_cap.py` 的 `QuestPoller` 只入队、只写行，不调 SDK getter。
-**要加/改 `quest/` 的时间列，改 `quest3.py`。**
+`quest3.py` 负责取四个 SDK 时间戳；`collect_cap.py` 的 `QuestPoller` 负责入队、追加
+主机接收时刻、写行。
 
 ## 4. 输出
 
@@ -249,7 +253,7 @@ sudo timedatectl set-ntp false      # 采完再 set-ntp true
 ```
 
 `.log` 是 ffmpeg 的 stderr，`.progress` 是 `-progress` 输出，都用来看相机是否真的
-在出帧，可以删。启动失败时同目录还会有 `startup_failure.json`，且不会创建
+在出帧，可以删。启动失败时诊断在 `Recordings/_startup_failures/`，不会创建
 `data.h5`；看到该文件表示本次不是成功采集。
 
 ### 4.1 `data.h5`
@@ -274,7 +278,7 @@ HDF5 只存索引性质的时间戳。
 | `alignment` | 固定 `none (raw per-source timestamps only)` |
 | `session` | `started_at` / `started_unix_ns` / `started_monotonic_ns`（按键）、`ready_wait_s`、`key_wait_s`、`auto_start`（`--no-wait`）、待机丢弃数 |
 | `hand` | 手别 `side`、Quest 请求手别 `pose_side_requested`、串口、SN、SDK/固件版本、故障、回调耗时、队列溢出、`standby_frames_discarded`、**首末帧时刻** `first/last_timestamp_unix_ns` 与 `first/last_timestamp_monotonic_ns` |
-| `quest` | enabled、rows、`valid_rows`、`first_sequence` / `last_sequence`、`standby_samples_discarded`、`selected_pose`（判据、待机/运行期变化次数、`stale_max_s`、`stale_warnings`）、samples_dropped、轮询次数与超时（`poller_overruns`）、`poller_alive`、**`errors`**、**首末 SDK 时间戳**（域未验证） |
+| `quest` | enabled、rows、`valid_rows`、`first_sequence` / `last_sequence`、`standby_samples_discarded`、`first/last_host_unix_ns`、`first/last_host_monotonic_ns`、`selected_pose`（判据、待机/运行期变化次数、`stale_warn_s`、`stale_max_s`、`stale_warnings`）、samples_dropped、轮询次数与超时（`poller_overruns`）、`poller_alive`、**`errors`**、**首末 SDK 时间戳**（域未验证） |
 | `cameras` | 每路设备、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s`（`camera.start()`→首帧）、`pre_roll_s`（首帧→按键）；汇总 `first_frame_s` |
 | `runtime` | `abort_reason`、`configured_sources`、出帧检查频率与各自停滞阈值（含 `quest_valid_*`、`quest_pose_*`）、`camera_stalls` / `glove_stalls` |
 | `verify` | 行数自检（`row_mismatch` 必须为空） |
@@ -357,9 +361,10 @@ python3.10 viewer/visualize.py ../Recordings/data_<日期>_<序号> --save-png r
 - 当前 sequence、SDK 相对时间、主位姿与四元数、追踪状态、手柄输入和手部关节数；
 - 缺失 SDK 时间戳保留断点；整列不可用时降级为轮询 sequence，并明确提示。
 
-**Quest 默认按 Unix 墙钟画在与手套相同的相对秒轴上**（`--quest-align unix`），
-因为 SDK 戳已约定为主机墙钟。这条口径**没有 C8 实证**，所以页面会标「已按 Unix
-墙钟对齐（未经 C8 验证）」，只有 `sdk_unix` 模式下才显示「已按 C8 验证的时钟对齐」。
+**Quest 默认用 `--quest-align auto`**：新版 `data.h5` 有 `quest/host_unix_ns`，
+就用**主机接收时刻**画在与手套相同的相对秒轴上（页面标「已按主机接收时刻对齐」，
+不需要 C8）；老文件没有这两列才回退 `unix`（把 SDK 戳当主机墙钟，标「未经 C8 验证」）。
+`--quest-align host` 强制主机接收时刻，`sdk_unix` 才走 C8 报告并标「已按 C8 验证」。
 
 `--quest-align none` 才保留独立时间轴：位置/四元数曲线映射到 `0%~100%` 归一化横轴，
 图宽和游标与手套主图对齐，但**不代表物理时间**。3D 轨迹固定放在右侧。
@@ -370,7 +375,7 @@ python3.10 viewer/visualize.py ../Recordings/data_<日期>_<序号> --save-png r
 `pose_6d` 是选定主位姿的紧凑表示：`x,y,z` 是米制位置，`qx,qy,qz,qw` 是姿态
 四元数；它不是手部 26 关节骨架，也不代表已经做过相机/手套空间外参标定。
 
-#### C8 时钟探针（可选，用于给时钟域留实证）
+#### C8 时钟探针（可选；新采集已不需要）
 
 先运行独立探针。它只写 `clock_probe/run_<时间>/samples.jsonl` 和 `report.json`，
 不会修改 `data.h5`：
@@ -403,9 +408,10 @@ python3.10 viewer/visualize.py ../Recordings/data_YYYYMMDD_N \
 对齐后 Quest 时间换算到手套首帧 Unix 时间轴。游标取目标时刻之前最近的 Quest 样本，
 不插值；同一时间戳重复时当前读数取最后一条，轨迹仍保留全部有效点。
 
-**默认是 `--quest-align unix`**（直接用 SDK 戳，不需要报告）。`sdk_unix` 才要求
-报告且文件质量达标，未通过时直接报错，不会静默对齐；给了 `--quest-clock-report`
-但模式不是 `sdk_unix` 时会提示报告被忽略。
+**默认是 `--quest-align auto`**：有 `quest/host_unix_ns` 用 host（主机接收时刻，
+不需要报告），没有才回退 `unix`。`sdk_unix` 才要求报告且文件质量达标，未通过时直接
+报错，不会静默对齐；给了 `--quest-clock-report` 但模式不是 `sdk_unix` 时会提示报告
+被忽略。C8 仍然可以给「SDK 时钟域」留实证，但新采集对齐不再依赖它。
 
 #### 视频面板（只做浏览器版）
 
@@ -597,7 +603,7 @@ view: false              # 采集时开实时窗口
 | `--pose-source` | `controller` | `controller` / `hand` / `head`，只影响 `pose_6d` |
 | `--pose-side` | `auto` | `auto` 跟随 `--cap-side`；`left` / `right` 可显式覆盖 |
 | `--quest-rate` | `120` | Quest 轮询频率 |
-| `--quest-ready-samples` | `10` | 判就绪所需的连续有效选定位姿样本数；另要求最近 0.5 s 位姿有变化 |
+| `--quest-ready-samples` | `10` | 判就绪所需的连续有效选定位姿样本数；位姿静止不影响就绪 |
 | `--no-wait` | 关 | 就绪后不等待按键，立即开始；非 TTY/自动化用 |
 | `--camera-mode` | `both` | `both` / `cam0` / `cam1` / `none` |
 | `--no-cameras` | 关 | 等价 `--camera-mode none` |
@@ -697,11 +703,11 @@ ls -l /dev/serial/by-id/ /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 | `检测到多个串口` | 有别的 CDC 设备；用 `--hand-port` 指定 |
 | 相机节点为 0 | 内核没识别到 UVC；`v4l2-ctl --list-devices` 与 `dmesg | tail` 对照 |
 | `等待 PXCap camX 摄像头画面超时` | 分辨率/帧率不被支持，先降到 640x480 / 15 fps |
-| 启动后一直停在 `[等待就绪]` | 看状态行：Quest 连续有效计数不涨 → 头显没戴/APK 没开 Tracking；计数涨但“最近变化”一直变大 → 手柄休眠，拿动一下；手套 0 帧 → 串口；相机没起 → 等 Quest/手套就绪后才会 `start()`。不想等 Quest 就加 `--no-quest` |
+| 启动后一直停在 `[等待就绪]` | 看状态行：Quest 连续有效计数不涨 → 头显没戴/APK 没开 Tracking；计数在涨但位姿长期不变是正常的（就绪不因静止撤回，1 s 只 warn）；只有 `valid_samples` 不涨、poller 卡住或手套 0 帧才要查；相机没起 → 等 Quest/手套就绪后才会 `start()`。不想等 Quest 就加 `--no-quest` |
 | 「准备完毕」后按键没反应 | 终端焦点不在程序窗口；或者 stdin 不是终端（nohup/管道），确认启动时没有直接报错；自动化用 `--no-wait` |
 | 视频开头有一段按键前的画面 | 预期：相机先起并等首帧，按键才开始写 `data.h5`。`manifest.cameras.*.pre_roll_s` 记长度，下游 Align 会按公共窗口丢掉 |
-| Quest 曲线末尾变成一条水平线 | 右手柄休眠/丢追踪，头显还在更新所以 `tracked` 仍为 true；`SelectedPoseWatch` 5 s 后会中止整场（1 s 先 warn）。看 `manifest.quest.selected_pose` |
-| Quest 和相机整体差约 2.5 s | SDK 时间戳比主机 Unix 快约 2.55 s，默认 `unix` 对齐会原样带过去；跑 C8 探针并走 `--quest-align sdk_unix`，见 `DOC/时间戳说明.md` |
+| Quest 曲线末尾变成一条水平线 | 右手柄静止或休眠；静止是合法数据，`SelectedPoseWatch` 只 warn、不中止。若确实是休眠，看 `manifest.quest.selected_pose.stale_warnings` |
+| Quest 和相机整体差约 2 s | 新采集用 `--quest-align host`/`auto`（主机接收时刻）就不会有这个问题；老文件没有 host 列，才需要跑 C8 探针并走 `--quest-align sdk_unix`，见 `DOC/时间戳说明.md` |
 | `时间戳不是墙钟时间` | ffmpeg 太老或命令被改；确认 `-use_wallclock_as_timestamps 1` |
 | 一直"尚未收到 PXCap 连续采集帧" | 串口占用、回调异常；看 manifest 的 `snapshot_errors` |
 | 相机 `actual_fps` 明显低于 30 | USB 带宽不够（两路 720p30 挂在同一个 Hub 上很常见）；换端口或降分辨率 |
@@ -747,9 +753,9 @@ ls -l /dev/serial/by-id/ /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 | 项 | 结果 |
 |---|---|
 | `py_compile` / `pyflakes` | 全过，0 告警 |
-| `selftest.py` | 当前 **206 项全过**（含无线 ADB、USB 回退、Quest 有效性、三源运行期检查、启动闸门/位姿冻结；装好 ffmpeg/ffprobe 的机器上不跳过相机组） |
+| `selftest.py` | 当前 **207 项全过**（含无线 ADB、USB 回退、Quest 有效性、三源运行期检查、启动闸门/位姿冻结；装好 ffmpeg/ffprobe 的机器上不跳过相机组） |
 | `--list-devices` | 正常输出串口 / V4L2 节点 / ffmpeg |
-| 无设备时报错 | 退出码 **2**，保留 `startup_failure.json`，不创建 `data.h5` |
+| 无设备时报错 | 退出码 **2**，诊断写 `Recordings/_startup_failures/<时间戳>_<原因>/`，不创建 `data_*` 目录 / `data.h5` |
 | 相机延迟测量 | **两路都尚未实测**；任何旧路径的数都已经作废，不能沿用 |
 | 假 SDK 驱动真实主循环（python3.10，5 秒） | 602 行、**120.0 Hz**、`verify` 为空、`alignment: none` |
 | 回调耗时（60 秒合成帧） | 均值 0.21 ms、最大 0.62 ms |
@@ -766,10 +772,12 @@ ls -l /dev/serial/by-id/ /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 - **启动闸门（待机 + 按键）真机未验证**：代码与 selftest 全过，但还没在真机上按过键。
   下一台真机要验：`[准备完毕]` 出现时 Quest/手套/相机都真的在出数、按键后 `quest/`
   第一行在按键之后（`manifest.session.started_at` / `quest.first_sequence`）、相机
-  `pre_roll_s` 与 mkv 开头一致、拔掉手柄 5 s 后 T3 中止并留下可读文件。
+  `pre_roll_s` 与 mkv 开头一致、手柄静止 1 s 只 warn 不中止、静止 5 s 后仍然继续录。
 - **Quest 跨源时间域**：XRoboToolKit 真机采集已跑通，`sdk_timestamp_ns` **约定**为主机
-  墙钟，下游据此默认对齐；但 C8 探针一直没跑，所以这个约定**没有实证**，产物里
-  `quest.clock_domain_verified=false` 会一直挂着。要留证据就跑上面的 C8 探针再走 `sdk_unix`。
+  墙钟。新采集（format 5）另带 `quest/host_unix_ns` 主机接收时刻，下游默认
+  `--quest-align auto` 用它对齐，summary 标 `alignment=host`、`clock_domain_verified=false`（C8 的 SDK 时钟域仍未验证）；老文件没有
+  host 列才回退 `unix`（false）。C8 探针没跑只影响「SDK 四列的时钟域」实证，不再阻断
+  新采集对齐；要验证就走上面的 C8 探针再显式 `--quest-align sdk_unix`。
 - **相机标定不做**（不是"没验证"，也不是"待实现"）：2026-11-17 决定划出范围，下游扩散
   模型只吃图像、不算位姿，四组量（内参/双相机外参/手套→相机/Quest→相机）都没有使用场景，
   见 [`../DOC/待验证清单.md`](../DOC/待验证清单.md) E8。代价是指尖三维位置、深度、

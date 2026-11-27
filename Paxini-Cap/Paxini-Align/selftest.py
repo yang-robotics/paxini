@@ -121,6 +121,7 @@ def add_quest(
     start_s: float = 0.0,
     seconds: float = 4.5,
     gap_s: tuple[float, float] | None = None,
+    with_host: bool = False,
 ) -> None:
     rows = int(seconds * rate)
     dt = int(1e9 / rate)
@@ -141,6 +142,16 @@ def add_quest(
     with h5py.File(rec / "data.h5", "r+") as f:
         quest = f.create_group("quest")
         quest.create_dataset("sdk_timestamp_ns", data=sdk)
+        if with_host:
+            # New captures: PC receive time, ~2 s ahead of the headset clock in
+            # this fixture (the real offset changes per session).
+            quest.create_dataset(
+                "host_unix_ns", data=sdk + 2_000_000_000
+            )
+            quest.create_dataset(
+                "host_monotonic_ns",
+                data=sdk - t0_ns + 6_000_000_000,
+            )
         quest.create_dataset("body_timestamp_ns", data=np.full(rows, -1, dtype=np.int64))
         quest.create_dataset("motion_timestamp_ns", data=np.full(rows, -1, dtype=np.int64))
         quest.create_dataset(
@@ -617,6 +628,42 @@ def test_quest_clock_model_inverse(tmp: Path) -> None:
     )
 
 
+def test_quest_host_mode(tmp: Path) -> None:
+    """New captures: align on host_unix_ns, no C8 report; auto picks host."""
+    rec = make_recording(tmp)
+    add_quest(rec, with_host=True)
+    result = run(rec, quest_alignment=ac.QUEST_ALIGNMENT_AUTO)
+    quest = result["quest"]
+    check(
+        "host/auto 有 host 列时选 host",
+        quest["mode"] == ac.QUEST_ALIGNMENT_HOST
+        and quest["paired_fraction"] > 0.9,
+        f"mode={quest['mode']} 有效={quest['paired_fraction']:.3f}",
+    )
+    out = ac.write_aligned(result, tmp / "host_out")
+    with h5py.File(out) as f:
+        host = f["quest/timestamp_host_unix_ns"][:].astype(np.int64)
+        sdk_rows = f["quest/data/sdk_timestamp_ns"][:].astype(np.int64)
+        valid = f["quest/valid"][:]
+        summary = json.loads(f.attrs["summary"])
+    check(
+        "host/主机时刻来自 host_unix_ns，不是 SDK 戳",
+        bool(np.any(valid))
+        and np.array_equal(
+            host[valid], (sdk_rows[valid] + 2_000_000_000)
+        )
+        and int(np.max(np.abs(host[valid] - sdk_rows[valid]))) > 1_000_000_000,
+        f"差值 {int(np.max(np.abs(host[valid] - sdk_rows[valid])))} ns",
+    )
+    check(
+        "host/summary 标 alignment=host、clock_domain_verified=false，不需要 C8",
+        summary["quest"]["alignment"] == ac.QUEST_ALIGNMENT_HOST
+        and summary["quest"]["clock_domain_verified"] is False
+        and summary["quest"]["clock_report_sha256"] is None,
+        str(summary["quest"]),
+    )
+
+
 def test_quest_missing_semantics(tmp: Path) -> None:
     rec = make_recording(tmp)
     # 窗口内部的 0.5 s 空档：这些行在 Quest 有效区间之内，配不到刚发生的样本，
@@ -932,6 +979,7 @@ def main() -> int:
             test_quest_unix_mode_ignores_source_coverage,
             test_quest_pose_nan_not_used,
             test_quest_clock_model_inverse,
+            test_quest_host_mode,
             test_quest_missing_semantics, test_quest_full_group_written,
             test_quest_file_quality_gate, test_quest_coverage_gate,
             test_quest_requires_report, test_quest_cli_roundtrip,

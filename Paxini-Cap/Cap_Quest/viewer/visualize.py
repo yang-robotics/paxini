@@ -970,10 +970,14 @@ def run_window(payload: dict[str, Any], root: Path,
             else:
                 pose_text = "xyz —"
             tracked = quest["tracked"][qi] if qi < len(quest["tracked"]) else False
+            alignment_text = {
+                "host": "主机接收对齐",
+                "sdk_unix": "Unix 对齐 (C8)",
+                "unix": "Unix 对齐（未验证）",
+            }.get(quest.get("alignment"), "未跨源对齐")
             quest_text.set_text(
                 f"Quest {qi + 1}/{qn} · {time_text} · {pose_text} · "
-                f"{'tracked' if tracked else 'untracked'} · "
-                f"{'Unix 对齐' if quest_aligned else '未跨源对齐'}"
+                f"{'tracked' if tracked else 'untracked'} · {alignment_text}"
             )
         ax_text.set_title(
             f"当前帧 {frames[index]}   ·   {x - t[0]:.2f} s",
@@ -2168,7 +2172,7 @@ function finite(v) { return v !== null && v !== undefined && Number.isFinite(v);
 
 function questIndex() {
   if (!QN) return 0;
-  if (QUEST.alignment === 'sdk_unix') {
+  if (QUEST.time_based) {
     const target = CAP.t[state.i] - T0;
     if (!QUEST.validRows) {
       QUEST.validRows = [];
@@ -2367,13 +2371,13 @@ function drawQuest3DOverlay() {
 }
 
 function questChartX(index) {
-  if (QUEST.alignment === 'sdk_unix') return QUEST.time[index];
+  if (QUEST.time_based) return QUEST.time[index];
   if (QN <= 1) return 0;
   return index / (QN - 1);
 }
 
 function questXBounds() {
-  if (QUEST.alignment === 'sdk_unix') return [0, Math.max(T1 - T0, 1e-6)];
+  if (QUEST.time_based) return [0, Math.max(T1 - T0, 1e-6)];
   return [0, 1];
 }
 
@@ -2426,7 +2430,7 @@ function drawQuestSeriesChart(key, plotId, block, columns, colors) {
     const value = xLo + (xHi - xLo) * k / 4;
     const x = Math.round(xOf(value)) + 0.5;
     ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, h - pad.b); ctx.stroke();
-    const shown = QUEST.alignment === 'sdk_unix'
+    const shown = QUEST.time_based
       ? fmtTime(value)
       : Math.round(value * 100) + '%';
     ctx.fillText(shown, x, h - 6);
@@ -2556,7 +2560,10 @@ function buildQuest() {
   const sideLabel = QUEST.pose_side === 'right' ? '右手柄' : '左手柄';
   el('questMeta').textContent =
     QUEST.rows + ' 行 · ' + QUEST.shown + ' 点 · ' +
-    (aligned ? (verified ? 'Unix 对齐 (C8)' : 'Unix 对齐') 
+    (aligned
+      ? (QUEST.alignment === 'host'
+          ? '主机接收对齐'
+          : verified ? 'Unix 对齐 (C8)' : 'Unix 对齐（未验证）')
       : QUEST.time_source === 'sdk_timestamp_ns' ? '归一化进度' : '轮询序号');
   el('questAlignNote').classList.toggle('aligned', aligned);
   el('questAlignNote').textContent = QUEST.alignment_note;
@@ -2743,7 +2750,12 @@ function buildHeader() {
     ['Quest 行', META.quest_rows || 0],
     [
       'Quest 对齐',
-      QUEST ? (QUEST.alignment === 'sdk_unix' ? 'Unix' : '未做') : '无',
+      QUEST
+        ? (QUEST.alignment === 'sdk_unix'
+            ? 'Unix (C8)'
+            : QUEST.alignment === 'host' ? '主机接收'
+            : QUEST.alignment === 'unix' ? 'Unix (未验证)' : '未做')
+        : '无',
     ],
     ['时钟', META.clock],
     ['格式', 'v' + (META.format_version ?? '?')],
@@ -2931,10 +2943,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quest-align",
         choices=QUEST_ALIGNMENT_CHOICES,
-        default="unix",
+        default="auto",
         help=(
-            "unix=SDK 戳就是主机墙钟，直接对齐到手套 Unix 轴（默认）；"
-            "sdk_unix=先经 C8 报告的时钟模型换算；none=独立时间轴"
+            "auto=有 quest/host_unix_ns 用主机接收时刻（新采集，默认），"
+            "没有则回退 unix；host=强制主机接收时刻；"
+            "unix=SDK 戳当主机墙钟；sdk_unix=先经 C8 报告换算；"
+            "none=独立时间轴"
         ),
     )
     parser.add_argument(
@@ -2991,7 +3005,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.no_quest and args.quest_align in QUEST_ALIGNMENT_ACTIVE:
         print(
-            "[错误] --no-quest 与 --quest-align unix/sdk_unix 不能同时使用",
+            "[错误] --no-quest 与 --quest-align unix/host/sdk_unix 不能同时使用",
             file=sys.stderr,
         )
         return 2
