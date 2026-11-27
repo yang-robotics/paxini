@@ -15,11 +15,18 @@
 | `data_20261117_3` | 右手 | 双路 1280×720@30 | 2620 行 / 117.1 Hz | 26.3 s | 无（`quest_rows=0`） | 同上 |
 | `data_20261118_1` | 右手 | 双路 1280×720@30 | 2396 行 / 115.9 Hz | 24.3 s | 无（`quest_rows=0`） | 本机现采 |
 
-四份的行数、频率、时长与各自的 `manifest.json` 逐项核对一致（2026-11-20，按
+四份样例的行数、频率、时长与各自的 `manifest.json` 逐项核对一致（2026-11-20，按
 `manifest.rows` / `actual_rate_hz` / `duration_s` 读，不按目录名猜）；`data.h5` 均为
-`format_version=4`，可直接喂 [`../Paxini-Align/align_capture.py`](../Paxini-Align/align_capture.py)。**2026-11-27 起新采集是 format 5**（`quest/` 多 `host_unix_ns`/`host_monotonic_ns`），老 4 文件没有这两列、Align 会自动回退 `unix`。
+`format_version=4`，可直接喂 [`../Paxini-Align/align_capture.py`](../Paxini-Align/align_capture.py)。
+**从 `data_20261127_10` 起新采集是 format 5**（`quest/` 多 `host_unix_ns`/`host_monotonic_ns`），
+老的 `_1..4/_9` 和这四份样例没有两列、Align 会自动回退 `unix`。
 
-**四份都没有 Quest 行**（`quest_rows=0`、`quest.enabled=false`）。表格早先给三份
+2026-11-27 本机测试另采了 `data_20261127_1..4/9`（format 4）和 `data_20261127_10`
+（format 5，2264 行 Quest + host 列）；`_5.._8` 的启动失败工件已移到
+`_startup_failures/`。这些本地测试都不入库；四份样例来自 Release 资产，也不在 git 里（`git ls-files Paxini-Cap/Recordings` 只有本 README）。
+
+**四份样例都没有 Quest 行**（`quest_rows=0`、`quest.enabled=false`）；本地 `_10` 有
+Quest host 行，C8 仍未跑。表格早先给三份
 20261117 样例标过「有」，那是因为 `data.h5` 里有空的 `quest/` 组——组在、行是 0，
 不等于采到了数据；C8 与 Quest 对齐在这批数据上无从验证（下游默认对齐遇到这类文件会
 自动跳过，不会报错）。
@@ -27,8 +34,8 @@
 ## 启动失败工件（2026-11-27 起）
 
 启动失败/启动错误**不再**在 `Recordings/` 里留 `data_*` 目录：诊断写到
-`Recordings/_startup_failures/<时间戳>_<原因>/`（`startup_failure.json` + 每路相机
-`cameras/*.log` + 完整 ffmpeg 命令；预录 mkv 不保留）。`data_*` 目录只放成功采集；
+输出目录父级的 `_startup_failures/<时间戳>_<原因>/`（默认 `Recordings/_startup_failures/`；
+`startup_failure.json` + 每路相机 `cameras/*.log` + 完整 ffmpeg 命令；预录 mkv 不保留）。`data_*` 目录只放成功采集；
 待机期按 Ctrl+C 会删掉本次输出目录、只在日志说明，不产生失败工件。
 
 ## 已知限制

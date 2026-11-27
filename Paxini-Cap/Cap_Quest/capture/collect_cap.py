@@ -1479,7 +1479,22 @@ class Hdf5Recorder:
         timestamps = np.asarray(timestamps_ns, dtype=np.int64)
         if timestamps.size > 1 and np.any(np.diff(timestamps) < 0):
             raise RuntimeError(
-                f"PXCap {camera_id} 摄像头时间戳非单调递增，数据不可用"
+                f"PXCap {camera_id} 摄像头时间戳倒退，数据不可用"
+            )
+        # ffmpeg's V4L2 wall clock can repeat a timestamp for two frames. The
+        # raw data stays as recorded (dropping a timestamp without dropping the
+        # matching video frame would break the frame mapping), but count it so
+        # the manifest/Quickstart check can surface it; Paxini-Align collapses
+        # the repeat and skips the redundant frame.
+        duplicate_timestamps = (
+            int(np.count_nonzero(np.diff(timestamps) == 0))
+            if timestamps.size > 1
+            else 0
+        )
+        if duplicate_timestamps:
+            warn(
+                f"PXCap {camera_id} 相机时间戳有 {duplicate_timestamps} 个重复；"
+                "Align 会保留首帧、跳过其余重复帧"
             )
         mono: np.ndarray | None = None
         if monotonic_ns is not None and len(monotonic_ns) > 0:
@@ -1495,7 +1510,7 @@ class Hdf5Recorder:
                 )
             if mono.size > 1 and np.any(np.diff(mono) < 0):
                 raise RuntimeError(
-                    f"PXCap {camera_id} 摄像头单调钟时间戳非单调递增，数据不可用"
+                    f"PXCap {camera_id} 摄像头单调钟时间戳倒退，数据不可用"
                 )
         with self._lock:
             assert self.file is not None
@@ -1511,6 +1526,7 @@ class Hdf5Recorder:
                 "last_timestamp_unix_ns": (
                     int(timestamps[-1]) if timestamps.size else None
                 ),
+                "duplicate_timestamps": duplicate_timestamps,
             }
             if mono is not None:
                 if "timestamp_monotonic_ns" in group:
@@ -2312,9 +2328,10 @@ def write_startup_failure(
 
     Since 2026-11-27 a startup failure no longer leaves a numbered
     ``data_<date>_<n>`` directory behind: the JSON and each camera's ffmpeg log
-    are copied to ``Recordings/_startup_failures/<timestamp>_<reason>/``, and
-    the camera pre-roll mkv (if any) is not kept. The caller removes the
-    abandoned output directory after this function returns.
+    are copied to ``<output-dir-parent>/_startup_failures/<timestamp>_<reason>/``
+    (default ``Recordings/_startup_failures/``), and the camera pre-roll mkv
+    (if any) is not kept. The caller removes the abandoned output directory
+    after this function returns.
     """
     failure_dir.mkdir(parents=True, exist_ok=True)
     camera_log_dir = failure_dir / "cameras"
@@ -3543,6 +3560,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                             ),
                             "last_timestamp_unix_ns": (
                                 info["last_timestamp_unix_ns"]
+                            ),
+                            "duplicate_timestamps": info.get(
+                                "duplicate_timestamps", 0
                             ),
                             "monotonic_available": info.get(
                                 "monotonic_available", False

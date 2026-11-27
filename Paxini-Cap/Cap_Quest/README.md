@@ -151,8 +151,8 @@ Quest      由 --no-quest 决定。装配失败（PC Service / ADB / SDK）→ �
 原样保存，不做镜像或符号转换。
 
 启动在创建 `data.h5` 之前失败时，程序把诊断写到
-`Recordings/_startup_failures/<时间戳>_<原因>/`：`startup_failure.json` + 每路相机
-`cameras/*.log` + 完整 ffmpeg 命令和日志末尾；`data_*` 目录和预录 mkv 会被清掉，
+默认 `Recordings/_startup_failures/<时间戳>_<原因>/`（自定义 `--output-dir` 时在其父目录的
+`_startup_failures/`）：`startup_failure.json` + 每路相机 `cameras/*.log` + 完整 ffmpeg 命令和日志末尾；`data_*` 目录和预录 mkv 会被清掉，
 不会生成伪造 HDF5，也不会占 `data_*` 编号。`--output-dir` 原本已存在时不删除用户目录。
 
 #### 没有一键脚本（2026-11-20 起）
@@ -253,7 +253,7 @@ sudo timedatectl set-ntp false      # 采完再 set-ntp true
 ```
 
 `.log` 是 ffmpeg 的 stderr，`.progress` 是 `-progress` 输出，都用来看相机是否真的
-在出帧，可以删。启动失败时诊断在 `Recordings/_startup_failures/`，不会创建
+在出帧，可以删。启动失败时诊断在输出目录父级的 `_startup_failures/`（默认 `Recordings/_startup_failures/`），不会创建
 `data.h5`；看到该文件表示本次不是成功采集。
 
 ### 4.1 `data.h5`
@@ -279,7 +279,7 @@ HDF5 只存索引性质的时间戳。
 | `session` | `started_at` / `started_unix_ns` / `started_monotonic_ns`（按键）、`ready_wait_s`、`key_wait_s`、`auto_start`（`--no-wait`）、待机丢弃数 |
 | `hand` | 手别 `side`、Quest 请求手别 `pose_side_requested`、串口、SN、SDK/固件版本、故障、回调耗时、队列溢出、`standby_frames_discarded`、**首末帧时刻** `first/last_timestamp_unix_ns` 与 `first/last_timestamp_monotonic_ns` |
 | `quest` | enabled、rows、`valid_rows`、`first_sequence` / `last_sequence`、`standby_samples_discarded`、`first/last_host_unix_ns`、`first/last_host_monotonic_ns`、`selected_pose`（判据、待机/运行期变化次数、`stale_warn_s`、`stale_max_s`、`stale_warnings`）、samples_dropped、轮询次数与超时（`poller_overruns`）、`poller_alive`、**`errors`**、**首末 SDK 时间戳**（域未验证） |
-| `cameras` | 每路设备、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s`（`camera.start()`→首帧）、`pre_roll_s`（首帧→按键）；汇总 `first_frame_s` |
+| `cameras` | 每路设备、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s`（`camera.start()`→首帧）、`pre_roll_s`（首帧→按键）、`duplicate_timestamps`（相邻同戳帧数；Align 去重）；汇总 `first_frame_s` |
 | `runtime` | `abort_reason`、`configured_sources`、出帧检查频率与各自停滞阈值（含 `quest_valid_*`、`quest_pose_*`）、`camera_stalls` / `glove_stalls` |
 | `verify` | 行数自检（`row_mismatch` 必须为空） |
 | `env` | python / numpy / h5py / ffmpeg 版本 |
@@ -365,6 +365,10 @@ python3.10 viewer/visualize.py ../Recordings/data_<日期>_<序号> --save-png r
 就用**主机接收时刻**画在与手套相同的相对秒轴上（页面标「已按主机接收时刻对齐」，
 不需要 C8）；老文件没有这两列才回退 `unix`（把 SDK 戳当主机墙钟，标「未经 C8 验证」）。
 `--quest-align host` 强制主机接收时刻，`sdk_unix` 才走 C8 报告并标「已按 C8 验证」。
+
+老 format 4 文件没有 host 列时 `auto` 会回退 `unix`；`unix` 也按 Unix 墙钟秒绘制
+（不是归一化进度），所以会看到已知的约 +2 s 偏移——这正是这条老路径未验证的偏移。
+需要归一化进度就显式 `--quest-align none`。
 
 `--quest-align none` 才保留独立时间轴：位置/四元数曲线映射到 `0%~100%` 归一化横轴，
 图宽和游标与手套主图对齐，但**不代表物理时间**。3D 轨迹固定放在右侧。
@@ -753,9 +757,9 @@ ls -l /dev/serial/by-id/ /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 | 项 | 结果 |
 |---|---|
 | `py_compile` / `pyflakes` | 全过，0 告警 |
-| `selftest.py` | 当前 **207 项全过**（含无线 ADB、USB 回退、Quest 有效性、三源运行期检查、启动闸门/位姿冻结；装好 ffmpeg/ffprobe 的机器上不跳过相机组） |
+| `selftest.py` | 当前 **208 项全过**（含无线 ADB、USB 回退、Quest 有效性、三源运行期检查、启动闸门/位姿冻结；装好 ffmpeg/ffprobe 的机器上不跳过相机组） |
 | `--list-devices` | 正常输出串口 / V4L2 节点 / ffmpeg |
-| 无设备时报错 | 退出码 **2**，诊断写 `Recordings/_startup_failures/<时间戳>_<原因>/`，不创建 `data_*` 目录 / `data.h5` |
+| 无设备时报错 | 退出码 **2**，诊断写输出目录父级的 `_startup_failures/<时间戳>_<原因>/`（默认 `Recordings/`），不创建 `data_*` 目录 / `data.h5` |
 | 相机延迟测量 | **两路都尚未实测**；任何旧路径的数都已经作废，不能沿用 |
 | 假 SDK 驱动真实主循环（python3.10，5 秒） | 602 行、**120.0 Hz**、`verify` 为空、`alignment: none` |
 | 回调耗时（60 秒合成帧） | 均值 0.21 ms、最大 0.62 ms |

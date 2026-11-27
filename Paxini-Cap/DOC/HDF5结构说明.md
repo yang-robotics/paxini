@@ -61,12 +61,12 @@ data.h5
 
 ---
 
-## 2. 时间戳：只记各 SDK 自己给的
+## 2. 时间戳：设备/SDK 的原值 + Quest 主机接收时刻
 
 > 三个来源的时钟域、换算方式、坑，统一整理在 [`时间戳说明.md`](时间戳说明.md)。
 > 本节只回答"哪些字段是时间戳、谁打的"。
 
-手套用 pxhandsdk 帧结构里的两个读数，Quest 用 xrobotoolkit SDK 的四个读数，相机用 V4L2/ffmpeg 打的主机墙钟。
+手套用 pxhandsdk 帧结构里的两个读数，Quest 用 xrobotoolkit SDK 的四个读数 + 采集进程记录的 `host_unix_ns`/`host_monotonic_ns`（PC 接收时刻），相机用 V4L2/ffmpeg 打的主机墙钟。
 
 ![手套帧的时间戳来自 SDK](figures/timestamp-frame.svg)
 
@@ -209,14 +209,15 @@ Recordings/data_20261111_1/          # 在 Paxini-Cap 根下，不在 Cap_Quest 
 
 | 数据集 | 形状 | 类型 | 含义 |
 |---|---|---|---|
-| `timestamp_unix_ns` | (M,) | int64 | 该路全部视频帧的绝对墙钟，严格递增。就是 ffmpeg 写进容器的 pts |
+| `timestamp_unix_ns` | (M,) | int64 | 该路全部视频帧的绝对墙钟，通常严格递增；ffmpeg 偶发相邻帧同戳，采集端记 `duplicate_timestamps`，Align 保留首帧、跳过重复帧 |
 | `timestamp_monotonic_ns` | (M,) | int64 | **当前不创建。** 2026-11-17 及更早的文件里可能有这一列（当时相机走另一条采集路径），读的时候用 `"timestamp_monotonic_ns" in group` 判断 |
 
 现在只写第一列。**没有 `frame_index`、没有 `skew_ns`**——配对在采集端已经全部移除。
 
 这一列的来源是主机侧（V4L2 驱动 / ffmpeg），
-**不是某个 SDK**：它没法由 SDK 提供，删了视频就没有任何时间轴可干。相机时间戳和
-`quest/host_*` 是"只记 SDK 时间戳"规则的两类例外，都写在这里以免误解。
+**不是某个 SDK**：它没法由 SDK 提供，删了视频就没有任何时间轴可干。相机墙钟和
+`quest/host_*` 是两类主机读数：相机由驱动/ffmpeg 打，Quest 由采集进程在收到样本时读；
+两者都不冒充设备采样时刻，写在这里以免误解。
 
 ### 5.1 为什么相机时间戳只能是墙钟
 
@@ -248,7 +249,7 @@ V4L2 驱动在每次出帧的 `v4l2_buffer.flags` 里声明时钟类型（`TIMES
 | `pose`                         | 主位姿来源、分量顺序、坐标系说明                                                              |
 | `hand`                         | 单只手套手别 `side`、Quest 请求手别 `pose_side_requested`、串口、SN、SDK/固件版本、故障、回调耗时、队列溢出、`standby_frames_discarded` |
 | `quest`                        | `enabled`、`errors`、`timestamp_source`（`sdk_provided + host_receive`）、`timestamp_fields`、`host_receive_fields`、`rows`、`valid_rows`（已写入行里的有效行）、`first_sequence` / `last_sequence`、`standby_samples_discarded`、`first/last_host_unix_ns`、`first/last_host_monotonic_ns`、`selected_pose`（判据、待机/运行期变化、`stale_max_s`、`stale_warnings`）、`samples_dropped`、`poller_alive`、轮询次数与 `poller_overruns` |
-| `cameras`                      | `backend`（固定 `linux`）、每路设备节点、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s`（`camera.start()`→首帧）、`pre_roll_s`（首帧→按键） |
+| `cameras`                      | `backend`（固定 `linux`）、每路设备节点、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s`（`camera.start()`→首帧）、`pre_roll_s`（首帧→按键）、`duplicate_timestamps`（相邻同戳帧数，Align 去重） |
 | `runtime`                      | `abort_reason`（中止原因，正常结束为 null）、`configured_sources`、检查频率与停滞阈值（含 `quest_valid_*`、`quest_pose_*`）、`camera_stalls`、`glove_stalls` |
 | `verify`                       | 行数自检结果（`row_mismatch` 必须为空）                                                   |
 | `env`                          | python / numpy / h5py / ffmpeg 版本                                             |
@@ -283,7 +284,8 @@ with h5py.File("data.h5") as f:
 ```
 
 下游要做对齐的话：手套 ↔ 视频可以直接用墙钟（`cap/timestamp_unix_ns` 对
-`cameras/*/timestamp_unix_ns`）。手套 ↔ Quest 必须先确认 `sdk_timestamp_ns` 的时钟域，
+`cameras/*/timestamp_unix_ns`）。手套 ↔ Quest 优先用 `quest/host_unix_ns`（同一主机
+轴，无需 C8）；老文件没有 host 列，才需要确认 `sdk_timestamp_ns` 的时钟域，
 否则只能比增量、不能比绝对值。
 
 ### 8.1 一行长什么样
@@ -323,7 +325,7 @@ cameras/right_cam0      row 0
 ## 9. 写入策略与体积
 
 - 两条行轴各自缓冲，每 100 行 flush 一次；关闭时缩到精确行数。
-- 相机时间戳在停止后一次性写：先 `probe()` 拿 pts，再校验严格递增。
+- 相机时间戳在停止后一次性写：先 `probe()` 拿 pts，再校验不倒退；相邻同戳只计数（`duplicate_timestamps`），不删原始行，Align 去重。
 - 每行原始约 **7.3 KB**，其中分布力 7.14 KB。120 Hz 原始约 3.2 GB/小时；gzip 后
   取决于数据熵，合成数据实测 3.6 KB/行 ≈ 1.57 GB/小时。
 - 短录音有约 900 KB 的 chunk 预留，不是数据。
@@ -351,7 +353,7 @@ cameras/right_cam0      row 0
 读旧文件的老脚本在新文件上会直接 `KeyError`，不会有静默错误。
 
 对齐逻辑本身没有删除，只是搬到下游处理工程（现有 `Paxini-Align/`）。那边需要的
-输入这里都有：`cap` 的两个 SDK 时间戳、`quest` 的四个 SDK 时间戳、`cameras` 的墙钟。
+输入这里都有：`cap` 的两个 SDK 时间戳、`quest` 的四个 SDK 时间戳 + 两列主机接收时刻、`cameras` 的墙钟。
 
 下游**默认就对 Quest 做对齐**（`--quest-align auto`）：新版有 `quest/host_unix_ns`
 就用主机接收时刻（不要求 C8 报告）；老文件没有这两列才回退 `unix`（把 SDK 戳当主机

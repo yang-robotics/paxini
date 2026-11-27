@@ -192,16 +192,24 @@ m = json.loads(manifests[-1].read_text(encoding="utf-8"))
 print("目录:", manifests[-1].parent)
 print("手套:", m["rows"], "Quest:", m["quest_rows"], "有效 Quest:", m["quest"].get("valid_rows"), "频率:", m["actual_rate_hz"])
 print("错误:", m["error"], "行数不一致:", m["verify"]["row_mismatch"])
+print("Quest 时间源:", m["quest"].get("timestamp_source"), "host 首末:",
+      m["quest"].get("first_host_unix_ns"), m["quest"].get("last_host_unix_ns"))
 for name, cam in m["cameras"]["per_camera"].items():
-    print(name, cam.get("frames"), cam.get("actual_fps"), cam.get("error"))
+    print(name, cam.get("frames"), cam.get("actual_fps"), cam.get("error"),
+          "duplicate_timestamps=", cam.get("duplicate_timestamps", 0))
 PY
 ```
 
 手套行数必须非零；采了 Quest 时 `quest_rows` 和 `quest.valid_rows` 都必须非零
 （`valid_rows` 才是真正带 tracking 数据的行）；两路相机有帧；`row_mismatch` 为空。
+format 5 的 Quest 应带 `host_unix_ns`/`host_monotonic_ns`，`timestamp_source` 为
+`sdk_provided + host_receive`。相机的 `duplicate_timestamps>0` 不阻塞：采集端只计数，
+Align 会保留首帧、跳过重复帧并 warn；本改动前的采集（如 `_10`）manifest 没有该字段，
+脚本会打印 0，以 Align 的 warn/summary 为准。要验证实际对齐质量，再跑一次
+`python3.10 ../Paxini-Align/align_capture.py <采集目录> --dry-run`。
 
-启动失败时诊断在 `Recordings/_startup_failures/<时间戳>_<原因>/startup_failure.json`
-（没有 `data.h5`，也不占 `data_*` 编号），先看 `error`、`command_text` 和 `log_tail`。
+启动失败时诊断在输出目录父级的 `_startup_failures/<时间戳>_<原因>/startup_failure.json`
+（默认 `Recordings/`；没有 `data.h5`，也不占 `data_*` 编号），先看 `error`、`command_text` 和 `log_tail`。
 退出码：`0` 正常，`2` 启动失败或中止，`130` 第二次 `Ctrl+C` 强制结束；待机期按 Ctrl+C
 只清掉本次输出目录、不写失败工件。
 
@@ -211,7 +219,7 @@ PY
 RUN=$(find ../Recordings -maxdepth 2 -name data.h5 -printf '%T@ %h\n' \
   | sort -nr | head -1 | cut -d' ' -f2-)
 python3.10 viewer/visualize.py "$RUN" --html
-xdg-open "$RUN/viewer.html"
+xdg-open "$RUN/viewer.html"   # 报 GLIBCXX/libproxy 之类是桌面环境问题，直接用浏览器打开该文件即可
 ```
 
 Quest 面板、跨源对齐口径和视频面板见 [`README.md`](README.md) §4。
@@ -230,4 +238,4 @@ Quest 面板、跨源对齐口径和视频面板见 [`README.md`](README.md) §4
 | 相机日志有 `Unrecognized option 'fps_mode'` | ffmpeg < 5.0，装静态版或加 `--ffmpeg` |
 | Quest 起不来 | 检查 PC Service、USB 调试授权、局域网、Tracking/Send；不戴就加 `--no-quest` |
 | 停止时 ffmpeg `-9` | 看对应 `cameras/*.log`，确认相机能响应 SIGINT |
-| `Recordings/_startup_failures/` 里有 `startup_failure.json` | 本次没有启动；按其中的 `error` / `log_tail` 排查 |
+| 输出目录父级的 `_startup_failures/`（默认 `Recordings/`）里有 `startup_failure.json` | 本次没有启动；按其中的 `error` / `log_tail` 排查 |

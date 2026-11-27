@@ -559,6 +559,15 @@ def test_camera_monotonic(tmp_root: Path) -> None:
         str(info),
     )
 
+    dup_dir = tmp_root / "cam_duplicate"
+    with Hdf5Recorder(dup_dir, "head", "right", "right", ("cam0",), True) as rec:
+        info = rec.write_camera_timestamps("cam0", [base, base])
+    check(
+        "相机时间戳/重复时间戳计数写进 manifest 信息",
+        info.get("duplicate_timestamps") == 1,
+        str(info),
+    )
+
 
 class _FlushCounter:
     """Proxy around h5py.File that counts flush() calls."""
@@ -695,7 +704,7 @@ def test_camera_timestamp_guards(tmp_root: Path) -> None:
         )
     except RuntimeError as exc:
         unsorted = str(exc)
-    check("相机/单调钟列倒退时拒绝写入", unsorted is not None and "非单调递增" in unsorted,
+    check("相机/单调钟列倒退时拒绝写入", unsorted is not None and "倒退" in unsorted,
           (unsorted or "没有抛错")[:40])
 
     info = recorder.write_camera_timestamps(
@@ -764,9 +773,13 @@ def test_two_row_axes(tmp_root: Path) -> None:
     )
     broken.resize((cap_rows, broken.shape[1]))
 
-    recorder.write_meta(
-        {"alignment": "none", "rows": cap_rows, "format_version": 5}
+    manifest = recorder.manifest({"rows": cap_rows})
+    check(
+        "两轴/format_version 由 manifest 升到 5",
+        manifest.get("format_version") == 5,
+        str(manifest.get("format_version")),
     )
+    recorder.write_meta(manifest)
     recorder.__exit__(None, None, None)
 
     with h5py.File(output_dir / "data.h5", "r") as handle:
@@ -777,11 +790,6 @@ def test_two_row_axes(tmp_root: Path) -> None:
         check(
             "两轴/quest 主轴长度",
             handle["quest/sdk_timestamp_ns"].shape == (quest_rows,),
-        )
-        check(
-            "两轴/format_version 已升到 5",
-            int(handle["meta"].attrs["format_version"]) == 5,
-            str(handle["meta"].attrs.get("format_version")),
         )
         check(
             "两轴/quest 四列 SDK + 两列主机接收时刻都在",
@@ -835,8 +843,9 @@ def test_two_row_axes(tmp_root: Path) -> None:
         )
         check(
             "两轴/meta 属性为 JSON 字符串且声明不做对齐",
-            handle["meta"].attrs["alignment"] == '"none"'
-            and handle["meta"].attrs["rows"] == "6",
+            json.loads(handle["meta"].attrs["alignment"]).startswith("none")
+            and handle["meta"].attrs["rows"] == "6"
+            and int(handle["meta"].attrs["format_version"]) == 5,
             str(dict(handle["meta"].attrs)),
         )
 

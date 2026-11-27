@@ -85,6 +85,7 @@ except ImportError:
 from quest_view import (
     QUEST_ALIGNMENT_ACTIVE,
     QUEST_ALIGNMENT_CHOICES,
+    QUEST_ALIGNMENT_HOST,
     QUEST_ALIGNMENT_NOTE,
     QUEST_ALIGNMENT_SDK_UNIX,
     load_clock_report,
@@ -845,6 +846,7 @@ def run_window(payload: dict[str, Any], root: Path,
     quest_aligned = (
         bool(quest) and quest.get("alignment") in QUEST_ALIGNMENT_ACTIVE
     )
+    quest_host = bool(quest) and quest.get("alignment") == QUEST_ALIGNMENT_HOST
     quest_verified = bool(quest) and quest.get("alignment") == QUEST_ALIGNMENT_SDK_UNIX
     quest_valid_times: np.ndarray | None = None
     quest_valid_rows: np.ndarray | None = None
@@ -866,7 +868,9 @@ def run_window(payload: dict[str, Any], root: Path,
         max(0.015, total_y - 0.125),
         (
             (
-                "Quest：已按 C8 验证的 Unix 时钟对齐"
+                "Quest：已按主机接收时刻对齐（无需 C8）"
+                if quest_host
+                else "Quest：已按 C8 验证的 Unix 时钟对齐"
                 if quest_verified
                 else "Quest：已按 Unix 墙钟对齐（未经 C8 验证）"
                 if quest_aligned

@@ -910,9 +910,91 @@ def test_rejects_unsorted(tmp: Path) -> None:
     try:
         run(rec)
     except ac.AlignError as exc:
-        check("相机时间戳乱序时报错而不是硬算", "严格递增" in str(exc), str(exc)[:40])
+        check(
+            "相机时间戳乱序时报错而不是硬算",
+            "严格递增" in str(exc) or "倒退" in str(exc),
+            str(exc)[:40],
+        )
     else:
         check("相机时间戳乱序时报错而不是硬算", False, "没有抛错")
+
+
+def test_camera_duplicate_deduped(tmp: Path) -> None:
+    """Consecutive equal camera timestamps: keep first, preserve frame_index."""
+    rec = make_recording(tmp)
+    with h5py.File(rec / "data.h5", "r+") as f:
+        series = f["cameras/right_cam0/timestamp_monotonic_ns"][:]
+        series[20] = series[19]
+        f["cameras/right_cam0/timestamp_monotonic_ns"][...] = series
+    result = run(rec)
+    check(
+        "相机重复时间戳/去重且记账",
+        result["camera_duplicates"]["right_cam0"] == 1,
+        str(result["camera_duplicates"]),
+    )
+    path = ac.write_aligned(result, tmp / "dup_out")
+    with h5py.File(path) as f:
+        idx = f["frame_index"][:].astype(np.int64)
+        summary = json.loads(f.attrs["summary"])
+    check(
+        "相机重复时间戳/frame_index 保留原始帧号",
+        20 not in idx and 21 in idx,
+        f"frame_index 前几项 {idx[:6].tolist()}",
+    )
+    check(
+        "相机重复时间戳/summary 记录丢弃数",
+        summary["camera_duplicates"]["right_cam0"] == 1
+        and summary["dropped_duplicate_frames"] == 1,
+        str({k: summary.get(k) for k in ("camera_duplicates", "dropped_duplicate_frames")}),
+    )
+
+
+def test_camera_duplicate_deduped_unix(tmp: Path) -> None:
+    """The production unix timebase: equal stamps dedupe, not hard-error."""
+    rec = make_recording(tmp, with_mono=False)
+    with h5py.File(rec / "data.h5", "r+") as f:
+        series = f["cameras/right_cam0/timestamp_unix_ns"][:]
+        series[20] = series[19]
+        f["cameras/right_cam0/timestamp_unix_ns"][...] = series
+    result = run(rec)
+    check(
+        "相机重复时间戳/unix 时间基也去重",
+        result["timebase"] == "unix"
+        and result["camera_duplicates"]["right_cam0"] == 1,
+        f"timebase={result['timebase']} dups={result['camera_duplicates']}",
+    )
+    path = ac.write_aligned(result, tmp / "unix_dup_out")
+    with h5py.File(path) as f:
+        idx = f["frame_index"][:].astype(np.int64)
+    check(
+        "相机重复时间戳/unix 帧号保留原始",
+        20 not in idx and 21 in idx,
+        f"frame_index 前几项 {idx[:6].tolist()}",
+    )
+
+
+def test_camera_duplicate_other_reference(tmp: Path) -> None:
+    """A duplicate in a non-reference camera must still map frame_index."""
+    rec = make_recording(tmp, with_cam1=True)
+    with h5py.File(rec / "data.h5", "r+") as f:
+        series = f["cameras/right_cam0/timestamp_monotonic_ns"][:]
+        series[20] = series[19]
+        f["cameras/right_cam0/timestamp_monotonic_ns"][...] = series
+    result = run(rec, reference="right_cam1")
+    check(
+        "相机重复时间戳/参考另一路时也能去重",
+        result["reference"] == "right_cam1"
+        and result["camera_duplicates"]["right_cam0"] == 1,
+        f"ref={result['reference']} dups={result['camera_duplicates']}",
+    )
+    path = ac.write_aligned(result, tmp / "other_ref_out")
+    with h5py.File(path) as f:
+        idx = f["cameras/right_cam0/frame_index"][:].astype(np.int64)
+    check(
+        "相机重复时间戳/非参考相机的 frame_index 用原始帧号",
+        20 not in idx and 21 in idx,
+        f"frame_index 前几项 {idx[:6].tolist()}",
+    )
 
 
 def test_write_flag_repair(tmp: Path) -> None:
@@ -974,6 +1056,9 @@ def main() -> int:
             test_nearest_integer, test_counts_nearest, test_omit_distribution,
             test_timebase_selection, test_multi_camera_views, test_write_and_reopen,
             test_gates_pass, test_clock_offset_column, test_quality_gate_blocks_write, test_rejects_unsorted, test_write_flag_repair, test_lookup3_vector,
+            test_camera_duplicate_deduped,
+            test_camera_duplicate_deduped_unix,
+            test_camera_duplicate_other_reference,
             test_quest_causal_pairing, test_quest_duplicate_tie_break,
             test_quest_unix_mode_takes_previous_row,
             test_quest_unix_mode_ignores_source_coverage,

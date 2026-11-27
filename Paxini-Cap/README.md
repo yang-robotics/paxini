@@ -17,7 +17,7 @@ Paxini-Cap/
 ├── Recordings/         # 采集输出（data_<日期>_<序号>/），采集端与 Paxini-Align 共用
 ├── Paxini-Align/       # 下游：手套 + 可选 Quest 按相机帧时刻对齐（→ README）
 │   ├── align_capture.py    # 主程序：读 data.h5，输出 aligned_<cam>.h5
-│   └── selftest.py         # 合成数据自检 24 项，不接硬件
+│   └── selftest.py         # 合成数据自检 48 项，不接硬件
 ├── DOC/                # 文档（格式说明、时钟说明、待验证清单、标定）
 │   ├── README.md           # 文档索引 + 阅读顺序 + 维护约定
 │   ├── HDF5结构说明.md     # 逐字段说明 + 完整目录树（data.h5 的唯一权威文档）
@@ -52,13 +52,13 @@ SDK 时钟域）。老文件没有 host 列才回退 `unix`（同样标 false）
 **下游配对已有代码**：`Paxini-Align/` 把手套流按相机帧时刻重采样，Quest 取目标时刻
 之前最近的一条整行复制（见 §5）。
 
-**数据现状（2026-11-20 核对）**：`Recordings/` 里有 4 份，逐份字段见
-[`Recordings/README.md`](Recordings/README.md)。三份 `data_20261117_{1,2,3}` 是从 Release
-样例包里补回来的，`data_20261118_1` 是本地现采。**四份的 `manifest.quest_rows` 全是 0、
-`quest.enabled` 全是 false**，即仓库里没有任何一份带 Quest 行的采集，C8 与 Quest 对齐
-在当前工作区无从复查（默认对齐遇到这种文件会自动跳过，不会报错）；四份的
-`env.platform` 也都是 WSL2，**没有一份来自原生 Ubuntu/V4L2 路径**，那条路只有代码，
-没有留存的产物。
+**数据现状（样例为 2026-11-20 核对；2026-11-27 有本地测试）**：`Recordings/` 里的 4 份样例
+逐份字段见 [`Recordings/README.md`](Recordings/README.md)。三份 `data_20261117_{1,2,3}`
+是从 Release 样例包里补回来的，`data_20261118_1` 是本地现采。**四份样例的
+`manifest.quest_rows` 全是 0、`quest.enabled` 全是 false**；`env.platform` 也都是 WSL2，
+没有原生 Ubuntu/V4L2 样例。2026-11-27 本机测试另有 `data_20261127_1..4/9`（format 4）和
+`data_20261127_10`（format 5，带 `quest/host_unix_ns`、2264 行 Quest），都不入库；
+`_10` 是本机首份带 Quest 行的 format 5 采集，用它验证了 host 对齐。
 
 历史上的 13 份采集（2026-11-17 核对，原件已不在本工作区）里只有 4 份可用
 （`data_20261113_2 / _5 / _11`、`data_20261116_1`）；另外 8 份是采集中途被强杀的

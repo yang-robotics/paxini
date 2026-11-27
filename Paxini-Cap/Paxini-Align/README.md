@@ -31,6 +31,16 @@ data.h5（cap N 帧 @120Hz + cameras M 帧 @30Hz + quest Q 行）
 那些帧没有手套数据可插，只能丢。`manifest` 里 `dropped_outside_overlap` 记的就是它；
 采集端自己也会在日志里打一行「首帧与手套首帧相差 +x.x 秒」。
 
+### 相机重复时间戳
+
+ffmpeg 的 V4L2 墙钟偶尔会给相邻帧同一个时间戳（实测 `data_20261127_10` cam0 有 4 个）。
+采集端（本改动起的新采集）记 `cameras.per_camera.<id>.duplicate_timestamps`，但不删原始行；
+`data_20261127_10` 是本改动前采的，manifest 没有该字段，但 Align 仍会去重；Align 读相机时间戳时
+把连续相等的合并成一个网格点，保留首帧、跳过其余，并在日志里 warn。`frame_index` 用
+**原始视频帧号**（不是去重后的压缩行号），所以取图不会错位；被跳过的帧不进入训练行。
+`summary.camera_duplicates` / `dropped_duplicate_frames` 记账。
+硬错误只有时间戳**倒退**；重复不算错误。
+
 ## 公共有效窗口（2026-11-20 起）
 
 三源各自启停之后，单看「相机 vs 手套」已经不够：第二路相机可能比参考相机晚开或早停，
@@ -94,8 +104,9 @@ python3 align_capture.py <目录> --dry-run
 
 ### Quest 对齐（默认开启）
 
-SDK 时间戳已确认就是主机墙钟，所以**默认就对 Quest 做对齐，不需要任何前置验证、
-不需要额外参数**：
+新采集（format 5）带 **`quest/host_unix_ns` 主机接收时刻**，所以**默认就对 Quest 做
+对齐，不需要任何前置验证、不需要额外参数**；老文件没有 host 列才回退 `unix`（SDK 戳
+约定为主机墙钟，未经 C8 验证）。
 
 ```bash
 python3 align_capture.py <采集目录>              # 默认 --quest-align auto（新文件走 host，旧文件回退 unix）
@@ -202,19 +213,22 @@ python3.10 align_capture.py <采集目录> \
 | `state/resultant_force` | (K,10,3) | int16 | 10 路合力（0.1 N），线性插值后取整 |
 | `state/distribute_force` | (K,10,119,3) | int16 | 分布力，线性插值，gzip-1 |
 | `state/distribute_counts` | (K,10) | uint32 | 每槽位有效点数，最近邻，合计恒 444 |
-| `cameras/<id>/frame_index` | (K,) | int32 | **该路**在主轴时刻之前最近的一帧；多视角训练靠它取另一张图 |
+| `cameras/<id>/frame_index` | (K,) | int32 | **该路**在主轴时刻之前最近的一帧的**原始视频帧号**；多视角训练靠它取另一张图；重复时间戳帧被跳过后仍指向真实帧 |
 | `cameras/<id>/dt_ms` | (K,) | float32 | 该帧时刻 − 主轴时刻，**恒 ≤ 0**（因果取帧，不会用未来的画面）；唯一例外是主轴早于该路首帧的边界行 |
 | `cameras/<id>/timestamp_ns` | (K,) | int64 | 该帧的真实时刻 |
 | `quest/index` | (K,) | int64 | 所选源行号；无配对时为 `-1` |
 | `quest/valid` | (K,) | bool | 是否存在年龄 ≤ `--quest-max-age-ms`、且姿态有限的左邻样本 |
 | `quest/age_ms` | (K,) | float64 | 目标时刻减所选样本的主机 Unix 时刻，即这一行的滞后；无候选时为 NaN。**下游过滤“太旧”的行就看它** |
 | `quest/timestamp_sdk_ns` | (K,) | int64 | 所选样本的原始 SDK 时间戳；无配对时为 `-1` |
-| `quest/timestamp_host_unix_ns` | (K,) | int64 | 对齐用的主机 Unix 时刻：host 模式直接取 `quest/host_unix_ns`，sdk_unix 模式取 C8 模型换算值；无配对为 `-1` |
+| `quest/timestamp_host_unix_ns` | (K,) | int64 | 对齐用的主机 Unix 时刻：host 取 `quest/host_unix_ns`，sdk_unix 取 C8 模型换算值，unix 直接取 SDK 戳；无配对为 `-1` |
 | `quest/data/...` | (K,...) | 原类型 | 完整 `quest/` 数据组按所选行复制，保留嵌套组和属性 |
 
 `attrs["summary"]` 是一份 JSON 摘要（行数、`kept_rows`、按来源的丢弃计数、公共有效窗口、
 跨度分位、延迟值与 `camera_delay_source`、时钟跳变数、`clock_offset_ms{spread_ms,
-max_step_ms, steps_over_5ms}`）。Quest 启用时还会包含 C8 报告 SHA-256、有效配对比例和
+max_step_ms, steps_over_5ms}`）。`source_rows.camera` 是参考相机**去重前**的原始帧数，
+`camera_grid_rows` 是去重后的网格行数；`camera_duplicates` / `dropped_duplicate_frames`
+按相机记录重复时间戳帧。Quest 启用时还会包含有效配对比例；只有 `sdk_unix` 才有
+C8 报告 SHA-256（host/unix 为 `null`），以及
 年龄分位。`clock_offset_ms.spread_ms > 0` 就说明采集期间墙钟被调过，具体哪一行翻的看
 `glove/clock_offset_ns` 自己求差分。`--delay-ms` 没给、台账也读不到时，
 `camera_delay_source` 会写成「未标定 Δ=0（台账不可用，未做延迟补偿）」——看到这句就说明
@@ -314,7 +328,7 @@ cam0 那条，两路共用。差 2.9 ms，相对半帧（33 ms）可忽略，所
 ## 自检
 
 ```bash
-python3 selftest.py     # 41 项，不需要硬件，用合成数据精确校验插值、Quest host/unix/sdk_unix 门控
+python3 selftest.py     # 48 项，不需要硬件，用合成数据精确校验插值、相机重复时间戳去重、Quest host/unix/sdk_unix 门控
 ```
 
 覆盖：线性信号零误差还原、Δ 逐行精确相减、边界丢弃计数、

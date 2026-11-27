@@ -21,7 +21,7 @@ ffmpeg: auto             # auto = 先读 $FFMPEG 再找 PATH；也可写绝对�
 pose_source: controller  # controller / hand / head
 pose_side: auto          # auto=跟随 cap_side；left/right 可显式覆盖
 quest_rate: 120          # 主机轮询频率 Hz，不是头显推送频率
-quest_ready_samples: 10  # 连续多少条有效选定位姿才判就绪；还要求 0.5 s 内位姿有变化
+quest_ready_samples: 10  # 连续多少条有效选定位姿才判就绪；静止不撤回，冻结只告警
 no_quest: false          # true = 只采手套与相机，quest 组写 NaN
 
 # ---------------------------------------------------------------- 启动

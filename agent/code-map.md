@@ -14,7 +14,7 @@
 | 改配置加载/优先级 | `capture/collect_cap.py` | `load_config_file()`(:1727)、`apply_config()`(:1756) | `selftest` 的 "配置" 组 |
 | 改采集输出位置 | `capture/collect_cap.py` | `DEFAULT_OUTPUT_ROOT`(:91) | `--help` 看默认值，跑一次采集确认目录落在新位置；`Paxini-Align` 的批量默认路径是 `../Recordings`，挪了要一起说 |
 | 单只手套左右手选择 | `capture/collect_cap.py` | `HAND_SIDES`、`build_parser()`、`resolve_pose_side()`(:1622)、`main()` | `selftest` 的 "手别选择" 组 |
-| 启动失败诊断 | `capture/collect_cap.py` | `write_startup_failure()`(:1660)、`main()` 的 `finally` | `selftest` 的 "启动失败工件" 组 |
+| 启动失败诊断 | `capture/collect_cap.py` | `write_startup_failure()`(:2313)、`main()` 的 `finally` | `selftest` 的 "启动失败工件" 组 |
 | 采集主循环节拍 | `capture/collect_cap.py` | `pump_and_record()`(:2073) | 跑一次采集看 `manifest.row_mismatch` |
 | **启动闸门（待机 + 按键）** | `capture/collect_cap.py` | `StartGate`、`SelectedPoseWatch`、`read_start_key()`、`wait_for_camera_first_frames()`、`main()` 启动段 | `selftest` 的「启动闸门与位姿冻结」；真机看 `manifest.session` / `quest.standby_samples_discarded` |
 | **三源起停与运行期检查** | `capture/collect_cap.py` | `RuntimeMonitor`、`abort_recording()`、`main()` 启动段 | `selftest` 的「三源运行期检查」+「启动闸门与位姿冻结」；真机看 manifest `runtime.abort_reason` |
@@ -42,7 +42,7 @@
 | Quest 无线 ADB | `capture/quest3.py` | `parse_mdns_services()`、`pair_and_connect()`、`--pair/--wireless` | `selftest` 的 "无线 ADB" 组；真机 `quest3.py --pair` |
 | Quest C8 时钟探针 | `diagnostics/quest_clock_probe.py` | `run_probe()`、`evaluate_clock_samples()` | `selftest` 的 "C8 探针" 组；重复判据按持续时长（默认 1 s），产物落 `clock_probe/` |
 | 回放窗口 | `viewer/visualize.py` | `collect_payload()`(:380) → `run_window()`(:549) / `write_viewer()`(:966) | `--save-png` 出一张 |
-| Quest 回放 payload | `viewer/quest_view.py` | `load_quest_view()`(:161)、`load_clock_report()`(:115)、`take_evenly()`(:26) | `selftest` 的 "Quest 可视化"；默认 auto（新采集 host，老文件 unix），`none` 才独立轴 |
+| Quest 回放 payload | `viewer/quest_view.py` | `load_quest_view()`(:206)、`load_clock_report()`(:160)、`take_evenly()`(:71) | `selftest` 的 "Quest 可视化"；默认 auto（新采集 host，老文件 unix），`none` 才独立轴 |
 | 回放视频预览 | `viewer/visualize.py` | `build_preview()`(:302) | `selftest` 的 "视频" 组 |
 | 分布力空间散点图 | `viewer/visualize.py` + `viewer/sensor_layout_schematic.py` | `build_slot_force()` 的 `dist`、`drawDistribution()`；无本地 Studio 模型时用示意网格，切向箭头用 `dist.tangent` | `selftest` 的 "可视化分布力" / "示意布局" 组 |
 | 实时视图 | `viewer/live_view.py` | `HtmlLiveView`(:773) / `LiveView`(:920) | `--view` 起一次 |

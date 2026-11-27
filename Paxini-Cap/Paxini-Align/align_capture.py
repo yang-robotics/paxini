@@ -681,7 +681,6 @@ def align_quest_to_targets(
         "mode": mode,
         "target_clock": "host_unix_ns",
         "source_rows": int(raw.size),
-        "valid_rows": int(valid_indices.size),
         "pose_excluded_rows": int(pose_excluded),
         "index": selected,
         "valid": valid,
@@ -808,6 +807,11 @@ def align_recording(
             )
 
         cam_times: dict[str, np.ndarray] = {}
+        # Original frame index of every kept grid point. Duplicate timestamps
+        # are collapsed to the first frame, but ``frame_index`` must still
+        # point at the real mkv frame after the gap, not at the compressed row.
+        cam_frame_indices: dict[str, np.ndarray] = {}
+        camera_duplicates: dict[str, int] = {}
         for slot in slots:
             group = handle["cameras"][slot]
             if key not in group:
@@ -815,9 +819,27 @@ def align_recording(
             series = np.asarray(group[key][:], dtype=np.int64)
             if series.size == 0:
                 raise AlignError(f"cameras/{slot} 没有帧")
-            if not np.all(np.diff(series) > 0):
-                raise AlignError(f"cameras/{slot} 时间戳非严格递增")
-            cam_times[slot] = series
+            if series.size > 1 and np.any(np.diff(series) < 0):
+                raise AlignError(f"cameras/{slot} 时间戳倒退")
+            # ffmpeg's V4L2 wall-clock can repeat a timestamp for two (or a
+            # short burst of) frames. Keeping both would make the sampling
+            # grid non-increasing and the "last frame at or before" lookup
+            # ambiguous, so keep the first of each equal run and skip the
+            # rest. The source data.h5 and the mkv are untouched.
+            keep = np.ones(series.size, dtype=bool)
+            if series.size > 1:
+                keep[1:] = np.diff(series) > 0
+            duplicates = int(series.size - np.count_nonzero(keep))
+            if duplicates:
+                cam_frame_indices[slot] = np.flatnonzero(keep).astype(np.int64)
+                warn(
+                    f"相机 {slot} 有 {duplicates} 个重复时间戳帧，"
+                    "保留首帧、跳过其余（frame_index 仍指原始帧号）"
+                )
+            else:
+                cam_frame_indices[slot] = np.arange(series.size, dtype=np.int64)
+            cam_times[slot] = series[keep]
+            camera_duplicates[slot] = duplicates
 
         if reference is None:
             reference = slots[0]
@@ -825,17 +847,20 @@ def align_recording(
             raise AlignError(f"参考相机 {reference} 不在本文件里（有：{', '.join(slots)}）")
 
         reference_t = cam_times[reference]
+        reference_source_rows = int(
+            handle["cameras"][reference][key].shape[0]
+        )
         if "timestamp_unix_ns" not in handle["cameras"][reference]:
             raise AlignError(f"cameras/{reference} 缺少 timestamp_unix_ns，无法对齐 Quest")
         reference_unix = np.asarray(
             handle["cameras"][reference]["timestamp_unix_ns"][:],
             dtype=np.int64,
-        )
+        )[cam_frame_indices[reference]]
         if reference_unix.shape != reference_t.shape:
             raise AlignError(f"cameras/{reference} 的两个时间戳列长度不一致")
-        if reference_unix.size > 1 and not np.all(np.diff(reference_unix) > 0):
+        if reference_unix.size > 1 and np.any(np.diff(reference_unix) < 0):
             raise AlignError(
-                f"cameras/{reference} 的 Unix 时间戳非严格递增，无法对齐 Quest"
+                f"cameras/{reference} 的 Unix 时间戳倒退，无法对齐 Quest"
             )
         delay_ns = int(round(delay_ms * 1e6))
         master_t = reference_t - delay_ns
@@ -914,7 +939,7 @@ def align_recording(
         master_t = master_t[keep]
         master_unix_t = master_unix_t[keep]
         ref_raw = reference_t[keep]
-        ref_index = np.flatnonzero(keep).astype(np.int32)
+        ref_index = cam_frame_indices[reference][np.flatnonzero(keep)].astype(np.int32)
 
         if master_t.size == 0:
             raise AlignError(
@@ -991,7 +1016,7 @@ def align_recording(
             pos = np.searchsorted(series, master_t, side="right") - 1
             idx = np.clip(pos, 0, series.size - 1)
             views[slot] = {
-                "frame_index": idx.astype(np.int32),
+                "frame_index": cam_frame_indices[slot][idx].astype(np.int32),
                 "dt_ms": ((series[idx] - master_t) / 1e6).astype(np.float32),
                 "timestamp_ns": series[idx],
             }
@@ -1008,6 +1033,8 @@ def align_recording(
         "delay_ms": delay_ms,
         "glove_rows": int(glove_t.size),
         "camera_rows": int(reference_t.size),
+        "camera_source_rows": reference_source_rows,
+        "camera_duplicates": camera_duplicates,
         "aligned_rows": int(master_t.size),
         "dropped_outside": dropped,
         "windows": windows,
@@ -1291,8 +1318,14 @@ def aligned_summary(result: dict[str, Any]) -> dict[str, Any]:
         "kept_rows": result["aligned_rows"],
         "source_rows": {
             "glove": result["glove_rows"],
-            "camera": result["camera_rows"],
+            # Raw reference-camera frames (before the duplicate collapse).
+            "camera": result.get("camera_source_rows", result["camera_rows"]),
         },
+        "camera_grid_rows": result["camera_rows"],
+        "camera_duplicates": result.get("camera_duplicates", {}),
+        "dropped_duplicate_frames": int(
+            sum((result.get("camera_duplicates") or {}).values())
+        ),
         "dropped_outside_overlap": result["dropped_outside"],
         "dropped_by_glove": result.get("dropped_by_glove", 0),
         "dropped_by_camera": result.get("dropped_by_camera", {}),
@@ -1323,7 +1356,20 @@ def report(result: dict[str, Any], path: Path | None, delay_source: str) -> None
         + ("（单调钟，免疫 NTP）" if result["timebase"] == "mono"
            else "（墙钟；相机无单调钟列，这是当前唯一可用的一路时钟）"))
     log(f"  延迟补偿：{result['delay_ms']:.1f} ms（从相机戳中减去），来源 {delay_source}")
-    log(f"  手套 {result['glove_rows']} 帧 → 相机 {result['camera_rows']} 帧 → 对齐 {result['aligned_rows']} 行")
+    source_camera = result.get("camera_source_rows", result["camera_rows"])
+    duplicate_frames = sum((result.get("camera_duplicates") or {}).values())
+    dedup_note = (
+        f"（去重后 {result['camera_rows']}）" if duplicate_frames else ""
+    )
+    log(
+        f"  手套 {result['glove_rows']} 帧 → 相机 {source_camera} 帧"
+        f"{dedup_note} → 对齐 {result['aligned_rows']} 行"
+    )
+    if duplicate_frames:
+        log(
+            f"  相机重复时间戳帧丢弃 {duplicate_frames} 个："
+            f"{result.get('camera_duplicates')}"
+        )
     if result["dropped_outside"]:
         parts = [f"手套 {result.get('dropped_by_glove', 0)}"]
         parts += [

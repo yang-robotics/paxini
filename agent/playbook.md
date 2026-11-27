@@ -70,7 +70,7 @@ python3.10 ../Paxini-Align/align_capture.py <录制目录> \
 1. 改 `capture/collect_cap.py` 的 `CAP_DATASETS`（手套侧）或 `_quest_layout()`
    （Quest 侧），同时把 `format_version` 从 5 加一
 2. 改 `DOC/HDF5结构说明.md` 的字段表 + 版本变更表（**定点修改，不要整份重写**）
-3. 在 `selftest/selftest.py` 加一条用例，跑通 102→103 项
+3. 在 `selftest/selftest.py` 加一条用例，跑通 207→208 项（当前 Cap 208、Align 48）
 
 漏第 3 步的后果：下次别人改坏这个字段，没人发现。
 
