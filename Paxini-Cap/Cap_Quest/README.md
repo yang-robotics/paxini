@@ -150,10 +150,8 @@ Quest      由 --no-quest 决定。装配失败（PC Service / ADB / SDK）→ �
 `--pose-side left|right` 覆盖。选择手别只影响 provenance 和相机命名，手套原始字段
 原样保存，不做镜像或符号转换。
 
-启动在创建 `data.h5` 之前失败时，程序把诊断写到
-默认 `Recordings/_startup_failures/<时间戳>_<原因>/`（自定义 `--output-dir` 时在其父目录的
-`_startup_failures/`）：`startup_failure.json` + 每路相机 `cameras/*.log` + 完整 ffmpeg 命令和日志末尾；`data_*` 目录和预录 mkv 会被清掉，
-不会生成伪造 HDF5，也不会占 `data_*` 编号。`--output-dir` 原本已存在时不删除用户目录。
+启动在创建 `data.h5` 之前失败时，诊断写到输出目录父级的 `_startup_failures/`
+（默认 `Recordings/`）；细节和退出码见 §4.2。
 
 #### 没有一键脚本（2026-11-20 起）
 
@@ -188,6 +186,35 @@ python3.10 capture/collect_cap.py --no-quest          # 没有头显时
 
 相机走 `/dev/videoN`，节点序号可能随机（两路同型号尤其明显），所以默认 `auto` 每次
 自己枚举；要钉死就写 `--camera-0 /dev/video2 --camera-1 /dev/video0`。
+
+### 1.1 首次连接 Quest 3S（只做一次）
+
+1. 手机 Meta Horizon → 设备 → 头显设置 → 开发者模式；头显里再打开 **Wireless debugging**。
+2. USB-C 数据线连 PC，戴着头显，在 **允许 USB 调试** 对话框里点允许（可勾“始终允许”）。
+3. 确认连接：`adb devices -l` 状态必须是 `device`；`unauthorized` 说明头显里还没点允许。
+4. 装 APK：
+   ```bash
+   adb install -r ../sdk/xrobotoolkit/XRoboToolkit-Quest-*.apk
+   adb shell pm path com.xrobotoolkit.client.quest   # 有 package: 才算装上
+   ```
+5. 启动 APK：
+   ```bash
+   adb shell monkey -p com.xrobotoolkit.client.quest \
+     -c android.intent.category.LAUNCHER 1
+   ```
+6. APK 内开启 **Tracking** 和 **Send**，唤醒手柄；头显与 PC 连同一 Wi-Fi 网段
+   （PC Service 监听 `63901`，防火墙要放行）。
+
+不插 USB 线时，头显必须先开 Wireless debugging 并保持唤醒，然后：
+
+```bash
+python3.10 capture/collect_cap.py --quest-wireless --duration 60 --start-pc-service
+```
+
+程序先复用已连接的无线 ADB，再用 mDNS 找已配对的连接，失败才提示输入头显上的 6 位
+配对码；端口自动发现，找不到/配对失败会回退 USB。只想单独配对：
+`python3.10 capture/quest3.py --pair`。`prepare_quest()` 负责装/启动 APK；
+`--start-pc-service` 只负责启动 PC Service。
 
 ## 2. 时间戳
 
@@ -287,6 +314,43 @@ HDF5 只存索引性质的时间戳。
 `verify.row_mismatch` 非空说明某组数据集首维和自己的行数不一致，这种文件能打开，
 但下游按行取数会整体错位。
 
+#### 产物自检
+
+```bash
+python3.10 - <<'PY'
+import json
+from pathlib import Path
+m = sorted(Path("../Recordings").glob("data_*/manifest.json"),
+           key=lambda p: p.stat().st_mtime)[-1]
+d = json.loads(m.read_text(encoding="utf-8"))
+print("目录:", m.parent)
+print("手套:", d["rows"], "Quest:", d["quest_rows"],
+      "有效 Quest:", d["quest"].get("valid_rows"), "频率:", d["actual_rate_hz"])
+print("错误:", d["error"], "行数不一致:", d["verify"]["row_mismatch"])
+print("Quest 时间源:", d["quest"].get("timestamp_source"),
+      "host 首末:", d["quest"].get("first_host_unix_ns"),
+      d["quest"].get("last_host_unix_ns"))
+for name, cam in d["cameras"]["per_camera"].items():
+    print(name, cam.get("frames"), cam.get("actual_fps"), cam.get("error"),
+          "duplicate_timestamps=", cam.get("duplicate_timestamps", 0))
+PY
+```
+
+手套行数非零；采了 Quest 时 `quest_rows` / `valid_rows` 非零；两路相机有帧；
+`row_mismatch` 为空。format 5 的 Quest 带 `host_unix_ns` / `host_monotonic_ns`，
+`timestamp_source` 为 `sdk_provided + host_receive`。相机的 `duplicate_timestamps>0`
+不阻塞：采集端只计数，Align 保留首帧、跳过重复帧并 warn；改动前的采集（如 `_10`）
+manifest 没有该字段，脚本打印 0，以 Align 的 warn/summary 为准。要验证实际对齐质量：
+
+```bash
+python3.10 ../Paxini-Align/align_capture.py <采集目录> --dry-run
+```
+
+启动失败时诊断在输出目录父级的 `_startup_failures/<时间戳>_<原因>/startup_failure.json`
+（默认 `Recordings/`；没有 `data.h5`，不占 `data_*` 编号），先看 `error`、
+`command_text`、`log_tail`。退出码：`0` 正常，`2` 启动失败或中止，`130` 第二次
+`Ctrl+C` 强制结束；待机期按 Ctrl+C 只清掉本次输出目录，不写失败工件。
+
 ### 4.3 回放
 
 `visualize.py` 直接读采集目录，不需要重新解码视频：
@@ -308,6 +372,8 @@ python3.10 viewer/visualize.py ../Recordings/data_<日期>_<序号> --save-png r
 - `--html` 导出 `viewer.html`，手套/Quest 数据内嵌，双击就能看，方便发给别人；视频除外
   —— 转码后的 mp4 放在同级的 `preview/` 下，拷给别人时要连目录一起拷
 - `--save-png` 用 Agg 渲染首帧，无显示器也能出图
+- `xdg-open` 报 `GLIBCXX_...` / `libproxy` 之类是桌面环境（常见于 snap 版 VS Code）的
+  问题，和采集/viewer 无关；直接用浏览器打开导出的 `viewer.html` 即可
 
 #### 分布力空间散点图
 
