@@ -53,7 +53,9 @@ PXCap III 数据手套与 PXDex III 灵巧手的开发工作区。两条线，�
 ## 环境
 
 Python 3.10 + Ubuntu 22.04/24.04（原生安装）。手套 SDK 只能用 `python3.10`，
-系统自带的 3.12 加载不出 `PxCap3`。
+系统自带的 3.12 加载不出 `PxCap3`。Cap 侧的 Python 包统一装在 `Paxini-Cap/.venv`
+（`--system-site-packages`，建法见 [`Paxini-Cap/README.md` §1.0](Paxini-Cap/README.md)），
+每个新终端先 `source Paxini-Cap/.venv/bin/activate`。
 
 版本要求、`dpkg` 安装顺序、串口权限、ffmpeg 从哪来 —— 全在
 [`Paxini-Cap/README.md` §1–§2](Paxini-Cap/README.md)。

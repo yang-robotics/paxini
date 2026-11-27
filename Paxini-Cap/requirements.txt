@@ -1,10 +1,14 @@
-# PXCap III 采集的 Python 依赖。SDK 本身不经 pip 安装（随 DEB 装进系统 Python）。
+# PXCap III 采集的 Python 依赖。pxhandsdk 本身不经 pip 安装（随 DEB 装进系统 Python）。
 #
-# 必须用系统 python3.10 安装，不要用 venv（该环境 ensurepip 会失败）：
-#   python3.10 -m pip install --user -r requirements.txt
+# 用 Paxini-Cap/.venv（必须 --system-site-packages，否则看不见 DEB 里的 pxhandsdk）：
+#   cd Paxini-Cap
+#   /usr/bin/python3.10 -m venv --system-site-packages .venv
+#   source .venv/bin/activate
+#   pip install --ignore-installed -r requirements.txt
+# --ignore-installed：不复用 ~/.local 里的共享 numpy/h5py/matplotlib。
 #
 # 已验证版本（2026-11-20，Ubuntu 22.04 + python3.10.12）：
-#   numpy 2.2.6 / h5py 3.16.0 / matplotlib 3.10.9 / PyYAML 6.0.3 /
+#   numpy 2.2.6 / h5py 3.16.0 / matplotlib 3.10.9 / PyYAML 6.0.4 /
 #   xrobotoolkit-sdk 1.1.0 / opencv-python 5.1.0 / qrcode（[pil] 装 Pillow）
 numpy>=1.24
 h5py>=3.8

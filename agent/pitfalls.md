@@ -49,16 +49,30 @@ python -m pip install --force-reinstall --no-deps opencv-python
 
 ### `import pxhandsdk` 成功，但 `PxCap3` 不存在
 
-**根因**：用成 `python3`（3.12）了。3.12 能导入包，但拿不到 C 扩展的类。
+**根因**：用成 `python3`（可能是 conda 的 3.12/3.14）了。这些版本能导入包，但拿不到
+cpython-310 编译的 C 扩展。
 
 **对策**：一律 `python3.10`。自查：
 `python3.10 -c "import pxhandsdk; print(hasattr(pxhandsdk,'PxCap3'))"` 应为 `True`。
 
-### `python3.10 -m venv` 失败
+### venv 里 `import pxhandsdk` 过了，但 `PxCap3` 缺失
 
-**根因**：这个环境的 ensurepip 坏了。
+**现象**：`hasattr(pxhandsdk,'PxCap3')` 是 `False`，或者直接
+`ModuleNotFoundError: No module named 'pxhandsdk'`；手套连不上。
 
-**对策**：不用 venv，直接 `python3.10 -m pip install --user`。
+**根因**：`pxhandsdk` 是 deb 装到 `/usr/lib/python3/pxhandsdk/dist-packages` 的，只有
+系统 Python 的 `pxhandsdk.pth` 认识它。建 venv 时没加 `--system-site-packages`，或者
+用了 conda / 别的解释器，都看不到它。
+
+**对策**：优先重建（`python3.10 -m venv --system-site-packages Paxini-Cap/.venv`）；
+不想重建就把包装软链进去：
+
+```bash
+ln -sfn /usr/lib/python3/pxhandsdk/dist-packages/pxhandsdk \
+        Paxini-Cap/.venv/lib/python3.10/site-packages/pxhandsdk
+```
+
+`xrobotoolkit_sdk` 不一样：它由 pip 装进 venv，wheel 自带 `libPXREARobotSDK.so`，**不需要软链**。
 
 ### `sudo` 要密码，但脚本里没法交互
 
@@ -114,6 +128,18 @@ manifest 里记 `ffmpeg 退出码 -9` 或"未在 4 秒内退出"，mkv 没有 tr
 `stop()` 把 255 当成正常中断而不是失败。**别再把它加回去**，`selftest` 有反向断言。
 
 **另一条**：ffmpeg 被中断时退出码是 **255**，不是 0。判"正常停止"必须把 255 算进去。
+
+### `--start-pc-service` 报 `Exec format error`
+
+**现象**：`PC Service 启动失败：[Errno 8] Exec format error:
+'/opt/apps/roboticsservice/runService.sh'`。
+
+**根因**：厂商 1.0.0 的 `runService.sh` 没有 shebang（首行是 `DIR=$(...)`），并且用了
+bash 的 `BASH_SOURCE`。交互 shell 里 `./runService.sh` 能跑，是 bash 对 `ENOEXEC` 的
+兜底；Python 的 `subprocess.Popen([script])` 不做兜底。
+
+**对策**：代码已改成 `bash runService.sh`（`quest3.pc_service_command()`）。手动起也可用
+`bash /opt/apps/roboticsservice/runService.sh`。**别改回直接 exec。**
 
 ## 三、会静默毁数据
 
@@ -212,6 +238,46 @@ Ctrl+C 正好落在一次批量写中间，`RLock` 会让同一线程重入成�
 这类"已持锁"版本，不能在锁内再调公共方法。
 
 **对策**：Ctrl+C 只按一次，等它自己收尾（有 30 s 看门狗，超时也会落盘）。
+
+### quest 组开头总多一段 `-1`/`tracked=false`
+
+**现象**：`data_20261127_4` 前 371 行（3.09 s）`sdk_timestamp_ns=-1`，`_2` 前 958 行
+（7.98 s）；`_1`/`_3` 整份都是。
+
+**根因**：`QuestPoller` 在 ADB/SDK 之后立刻启动，`TimedStream` 是 `deque(maxlen=600)`；
+采集循环第一次 `drain()` 把待机期样本全部写进 HDF5，最多 5 s。不是「采集结束后还在写」——
+最后一条 Quest 换算后和最后一帧手套只差 0.09 ms。
+
+**已修（2026-11-27）**：`StartGate` 在待机期持续排空并丢弃 Quest/手套缓冲，按键后才创建
+`data.h5`；丢弃数量记 `manifest.quest.standby_samples_discarded`。
+**不要**再用「poller 一启动就写」来省一个按键。
+
+### quest 末尾一长段水平线，但 `tracked` 仍是 true
+
+**现象**：`data_20261127_4` 从第 1935 行起，`quest/pose_6d` 的 7 个数逐位不变，持续
+1670 行 / 13.9 s；同一时间头显 `head/pose_xyzw` 和左手一直更新。
+
+**根因**：右手柄休眠/丢追踪，APK 继续把最后一帧 pose 发上来。`quest/tracked` 是
+「头显 OR 手柄 OR 手部」的或，头显还在，所以整段都是 true；SDK 没有
+`get_right_controller_is_active` 之类的接口，`pose_info.tracked` 只看四元数模长，
+冻结的四元数模长仍是 1。**只有值本身能识别冻结**。
+
+**已修（2026-11-27）**：`SelectedPoseWatch` 看选定位姿的 7 个数；就绪要求 0.5 s 内有变化，
+录制期连续 5 s 不变即 `abort_recording`（1 s 先 warn）。manifest 记
+`quest.selected_pose.stale_max_s` / `stale_warnings`。
+
+### Quest 时间戳整体比主机 Unix 快约 2.55 s
+
+**现象**：`data_20261127_4` / `_2` 的 `quest/sdk_timestamp_ns` 与主机 Unix 的差恒定
+**+2.55 / +2.56 s**，30 s 内不漂。默认 `--quest-align unix` 把 sdk 当主机墙钟，于是
+Quest 整体放晚 2.55 s：开头 2.55 s 相机没有 Quest，末尾多出一截。
+
+**根因**：SDK 给的是头显时钟，不是这台主机的墙钟；C8 从未跑过。这不是「多一段待机
+数据」，起点闸门也修不了它。
+
+**对策**：跑 `diagnostics/quest_clock_probe.py`（重复判据 2026-11-27 起按持续时长，
+120 Hz 轮询不再误杀），拿通过的报告走 `--quest-align sdk_unix`。只看原始 `data.h5` 的
+sdk 列，偏移永远在；要么接受，要么走 C8。
 
 ## 四、重构相关的坑（2026-11-16 目录拆分后）
 

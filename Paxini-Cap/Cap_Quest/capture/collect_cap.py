@@ -18,10 +18,22 @@ Timing policy (deliberately different from ``Dex_Quest/collect_hand_pose.py``):
   reading is appended on top: a second clock source makes the columns
   incomparable and is impossible to undo downstream.
 
-The three sources start independently and are never waited for in sequence;
-health is checked from the capture loop, so a source that is still coming up
+Startup is split into a standby gate and a recording session. The Quest poller
+and the glove run while the gate waits for a real selected pose and real glove
+frames; once both are live the cameras start and the gate waits for each one's
+first frame. Only then does the terminal print "准备完毕" and wait for a single
+key press. The key is the recording start: `data.h5` is created there, and the
+standby Quest/glove buffers are discarded, so neither group carries pre-key rows.
+The cameras keep recording through the standby window (their mkv contains a
+pre-roll, exactly like the historical camera-first start); downstream Align
+drops frames outside the common window. A camera is never restarted, so the
+camera latency/timestamp code is untouched.
+
+Health is checked from the capture loop, so a source that is still coming up
 never holds up the rows already flowing. A configured source that stops
-producing data ends the run through the normal shutdown path.
+producing data ends the run through the normal shutdown path. Quest samples can
+keep arriving while the selected pose is frozen (controller asleep/lost); that
+is detected on the pose values, not on the sample counter, and ends the run.
 
 The glove callback runs on an SDK-owned thread and must stay short: it copies
 the frame into numpy arrays and pushes them into a queue. All file writing
@@ -37,6 +49,7 @@ import os
 import platform
 import queue
 import re
+import select
 import shlex
 import signal
 import sys
@@ -48,14 +61,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+try:  # POSIX terminal input; the collector itself only runs on native Ubuntu.
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - Windows import for selftest only
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
+
 try:
     import h5py
     import numpy as np
     import yaml
 except ImportError as exc:  # pragma: no cover - dependency guard
     print(
-        f"[错误] 缺少依赖：{exc}。请运行 "
-        "python3.10 -m pip install --user numpy h5py pyyaml",
+        f"[错误] 缺少依赖：{exc}。请在 Paxini-Cap/.venv 里运行 "
+        "pip install --ignore-installed -r requirements.txt（见 QUICKSTART 第 1 步）",
         file=sys.stderr,
     )
     raise SystemExit(2)
@@ -164,9 +184,32 @@ EMERGENCY_SAVE_TIMEOUT_S = 5.0
 # still save it. Module level because a signal handler only receives (signum, frame).
 ACTIVE_RECORDER: "Hdf5Recorder | None" = None
 SHUTDOWN_TIMEOUT_S = 30.0
-# 粗检阈值：相机/Quest 的时间窗与手套差太多就是录错了对象，只提示不纠正
+# Coarse sanity check: if a camera starts much later than the glove it is the
+# wrong source (coverage gap). A camera that starts *earlier* is normal under
+# the key-start model (it records a pre-roll), so that direction has its own
+# upper bound below.
 SESSION_START_TOLERANCE_S = 5.0
+#: Warn only when the camera pre-roll exceeds this many seconds; a short
+#: pre-key pre-roll is expected (the camera is live before the key).
+CAMERA_PRE_ROLL_WARN_S = 60.0
 FLUSH_ROWS = 100
+
+# -- start gate (key press starts the recording) --
+#: Consecutive valid selected-pose samples required for readiness.
+READY_QUEST_SAMPLES = 10
+#: The selected pose must have changed within this many seconds.
+READY_POSE_FRESH_S = 0.5
+#: Minimum glove frames before readiness.
+READY_GLOVE_FRAMES = 10
+#: The newest glove frame must be this fresh for readiness.
+READY_GLOVE_FRESH_S = 0.5
+#: How often the standby gate prints its status.
+READY_REPORT_S = 2.0
+#: A frozen selected pose: warn first, then abort the session (T3).
+QUEST_POSE_STALE_WARN_S = 1.0
+QUEST_POSE_STALE_ABORT_S = 5.0
+#: Poll interval while waiting for the key (also re-checks readiness).
+KEY_POLL_S = 0.1
 
 
 def log(message: str) -> None:
@@ -460,6 +503,606 @@ def extract_selected_pose(
     }
 
 
+class SelectedPoseWatch:
+    """Follow the *selected* Quest pose for readiness and staleness.
+
+    ``sample["tracked"]`` is an OR over head, controllers and hands, so it stays
+    true while a controller is asleep and the head keeps moving. The SDK also has
+    no per-controller ``is_tracked`` getter (checked against
+    ``xrobotkit_sdk``'s public API), and a stale pose keeps a unit quaternion, so
+    ``pose_info.tracked`` cannot tell it apart either. What can tell them apart
+    is the value itself: real tracking has sub-millimetre noise, a sleeping
+    controller repeats the last 7 numbers bit-for-bit.
+
+    One watch is used in two places:
+
+    * the standby gate requires ``required_samples`` consecutive valid poses and
+      a change within ``fresh_s`` (a frozen pose must not say "准备完毕");
+    * the runtime monitor uses ``age_s`` to warn at 1 s and abort at 5 s (T3).
+    """
+
+    def __init__(
+        self,
+        pose_source: str,
+        pose_side: str,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.pose_source = pose_source
+        self.pose_side = pose_side
+        self.clock = clock
+        self.started = clock()
+        self.last_pose: np.ndarray | None = None
+        self.last_change: float | None = None
+        self.last_valid: float | None = None
+        self.consecutive_valid = 0
+        self.samples = 0
+        self.valid_samples = 0
+        self.changes = 0
+        self.stale_warned = False
+
+    @property
+    def source_text(self) -> str:
+        if self.pose_source == "head":
+            return "head"
+        return f"{self.pose_source}.{self.pose_side}"
+
+    def update(self, sample: dict[str, Any], now: float | None = None) -> bool:
+        """Feed one sample; return True when it carried a usable selected pose."""
+        moment = self.clock() if now is None else now
+        self.samples += 1
+        pose = extract_selected_pose(
+            sample, self.pose_source, self.pose_side
+        )
+        values = pose.get("pose_xyzw")
+        if not pose.get("tracked") or values is None:
+            self.consecutive_valid = 0
+            return False
+        current = np.asarray(values, dtype=np.float64)
+        if current.shape != (7,) or not np.all(np.isfinite(current)):
+            self.consecutive_valid = 0
+            return False
+        self.valid_samples += 1
+        self.last_valid = moment
+        self.consecutive_valid += 1
+        if self.last_pose is None:
+            # First valid sample only anchors the comparison. It must not count
+            # as "the pose changed": a controller that was already frozen before
+            # the gate started would otherwise look fresh for free.
+            self.last_pose = current
+        elif not np.array_equal(current, self.last_pose):
+            self.last_pose = current
+            self.last_change = moment
+            self.changes += 1
+            self.stale_warned = False
+        return True
+
+    def mark_stale(self) -> None:
+        """Require a new pose change before this watch counts as fresh again.
+
+        Used after a blocking camera warm-up: samples drained after the block
+        are old, so a controller that froze during the block must not look
+        fresh just because it was read late.
+        """
+        self.last_change = None
+        self.stale_warned = False
+
+    def age_s(self, now: float | None = None) -> float:
+        """Seconds since the selected pose last changed.
+
+        Before the first valid sample this measures from the watch's creation,
+        so an invalid/frozen pose still ages into the T3 threshold instead of
+        looking fresh forever.
+        """
+        moment = self.clock() if now is None else now
+        anchor = self.last_change if self.last_change is not None else self.started
+        return max(0.0, moment - anchor)
+
+    def ready(
+        self,
+        now: float | None = None,
+        required_samples: int = READY_QUEST_SAMPLES,
+        fresh_s: float = READY_POSE_FRESH_S,
+    ) -> bool:
+        if self.last_change is None:
+            # No pose change has been observed since this watch was created, so
+            # there is no evidence the selected pose is live.
+            return False
+        moment = self.clock() if now is None else now
+        return (
+            self.consecutive_valid >= max(1, int(required_samples))
+            and max(0.0, moment - self.last_change) <= max(0.0, float(fresh_s))
+        )
+
+
+def drain_hand_frames(
+    hand_collector: HandCollector,
+) -> tuple[int, dict[str, Any] | None]:
+    """Discard (or hand over) every queued glove frame; return count + last."""
+    count = 0
+    last: dict[str, Any] | None = None
+    while True:
+        try:
+            last = hand_collector.frames.get_nowait()
+        except queue.Empty:
+            break
+        count += 1
+    return count, last
+
+
+def wait_for_camera_first_frames(
+    cameras: Sequence[FfmpegCamera],
+    timeout_s: float,
+) -> dict[str, float]:
+    """Block until every camera has produced its first frame.
+
+    Returns ``camera_id -> monotonic seconds`` of the first observed frame. A
+    missing frame is a hard startup failure: the session is configured to
+    record every listed camera, and a camera that opens but never streams would
+    otherwise produce a useless 0-frame mkv. ``STOP_EVENT`` ends the wait early
+    with an empty dict (the caller treats that as "user aborted").
+    """
+    if not cameras:
+        return {}
+    deadline = time.monotonic() + max(0.1, float(timeout_s))
+    first_at: dict[str, float] = {}
+    while len(first_at) < len(cameras):
+        if STOP_EVENT.is_set():
+            return {}
+        for camera in cameras:
+            if camera.camera_id in first_at:
+                continue
+            camera.poll_health()
+            if camera.progress_signal() > 0:
+                first_at[camera.camera_id] = time.monotonic()
+        if len(first_at) == len(cameras):
+            break
+        if time.monotonic() >= deadline:
+            waiting = [
+                camera.camera_id
+                for camera in cameras
+                if camera.camera_id not in first_at
+            ]
+            detail = "；".join(
+                f"{camera.camera_id}: {camera.failure or camera.log_tail() or '无日志'}"
+                for camera in cameras
+                if camera.camera_id in waiting
+            )
+            raise RuntimeError(
+                f"相机启动超时（{timeout_s:g} 秒）仍未出帧："
+                + ", ".join(waiting)
+                + (f"（{detail}）" if detail else "")
+            )
+        STOP_EVENT.wait(0.05)
+    return first_at
+
+
+def read_start_key(guard: Callable[[], bool]) -> str:
+    """Wait for one key press; return ``key`` / ``lost`` / ``abort``.
+
+    ``guard`` is called on every poll while no key is available; it drains the
+    Quest/glove buffers and re-checks readiness. Returning False from ``guard``
+    means the sources stopped being ready, so the caller withdraws the
+    "准备完毕" banner instead of starting on stale data.
+
+    The terminal is put in cbreak mode: no Enter needed, echo off, but ``ISIG``
+    stays enabled so Ctrl+C still works. The original attributes are restored
+    in ``finally`` even when the caller raises.
+    """
+    if termios is None or tty is None:  # pragma: no cover - Windows
+        raise RuntimeError(
+            "单键确认需要 POSIX 终端（termios）；当前平台不支持。"
+            "请加 --no-wait 跳过按键"
+        )
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "需要按任意键开始，但 stdin 不是终端（nohup/管道/重定向）。"
+            "请直接在终端运行，或加 --no-wait 让它就绪后自动开始"
+        )
+    fd = sys.stdin.fileno()
+    original = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while not STOP_EVENT.is_set():
+            try:
+                readable, _, _ = select.select([fd], [], [], KEY_POLL_S)
+            except InterruptedError:  # a signal (Ctrl+C) arrived mid-select
+                continue
+            if readable:
+                try:
+                    os.read(fd, 1)
+                except OSError:
+                    return "abort"
+                return "key"
+            if not guard():
+                return "lost"
+        return "abort"
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
+
+
+@dataclass
+class StartInfo:
+    """Everything the recording session needs to know about the key start."""
+
+    started_at: datetime
+    started_unix_ns: int
+    started_monotonic_ns: int
+    ready_wait_s: float
+    key_wait_s: float
+    auto_start: bool
+    quest_discarded: int
+    hand_discarded: int
+    quest_min_sequence: int | None
+    pose_watch: SelectedPoseWatch
+    camera_first_frame_s: dict[str, float]
+    camera_pre_roll_s: dict[str, float]
+
+
+class StartGate:
+    """Standby gate: wait for real data, start cameras, then wait for a key.
+
+    The gate never creates ``data.h5`` and never writes a row. It drains the
+    Quest stream and the glove queue so they cannot overflow while the operator
+    gets ready, and it starts the cameras only after the Quest pose and the
+    glove are both live. That ordering keeps the camera pre-roll short (the
+    camera warm-up plus the operator's reaction time, not the headset boot).
+
+    Once ``data.h5`` is created the monitor takes over; the gate has already
+    thrown away every pre-key row.
+    """
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        poller: QuestPoller | None,
+        quest_stream: TimedStream,
+        hand_collector: HandCollector,
+        cameras: Sequence[FfmpegCamera],
+        started_cameras: list[FfmpegCamera],
+    ) -> None:
+        self.args = args
+        self.poller = poller
+        self.quest_stream = quest_stream
+        self.hand_collector = hand_collector
+        self.cameras = list(cameras)
+        self.started_cameras = started_cameras
+        self.pose_watch = SelectedPoseWatch(args.pose_source, args.pose_side)
+        self.required_samples = max(1, int(args.quest_ready_samples))
+        self.started = time.monotonic()
+        self.quest_discarded = 0
+        self.hand_discarded = 0
+        self.hand_last_monotonic_ns: int | None = None
+        self.cameras_launched = False
+        self.camera_first_at: dict[str, float] = {}
+        self.camera_started_at: dict[str, int] = {}
+        self.camera_progress: dict[str, int] = {}
+        self.camera_last_growth: dict[str, float] = {}
+        self.ready_logged = False
+        self.ready_at: float | None = None
+        self._last_report = 0.0
+        #: The poller starts before this gate; its deque may hold up to five
+        #: seconds of pre-gate samples. They must not anchor the pose watch,
+        #: otherwise a controller that froze before the gate would look fresh.
+        self._pose_primed = False
+
+    # -- source refresh ----------------------------------------------------
+    def refresh(self, now: float | None = None) -> bool:
+        moment = time.monotonic() if now is None else now
+        if self.poller is not None and self.poller.failure is not None:
+            raise RuntimeError(f"Quest 轮询异常：{self.poller.failure}")
+        if self.poller is not None:
+            samples = self.quest_stream.drain()
+            if not self._pose_primed:
+                # Throw the pre-gate backlog away; the watch starts from the
+                # next sample and must observe a real change after this point.
+                self.quest_discarded += len(samples)
+                self._pose_primed = True
+            else:
+                for sample in samples:
+                    self.quest_discarded += 1
+                    self.pose_watch.update(sample.data, now=moment)
+        count, last = drain_hand_frames(self.hand_collector)
+        self.hand_discarded += count
+        if last is not None:
+            self.hand_last_monotonic_ns = int(last["timestamp_monotonic_ns"])
+        self._check_camera_growth(moment)
+        return self.is_ready(moment)
+
+    def _check_camera_growth(self, now: float) -> None:
+        if not self.cameras_launched:
+            return
+        for camera in self.cameras:
+            camera_id = camera.camera_id
+            camera.poll_health()
+            progress = camera.progress_signal()
+            if progress > self.camera_progress.get(camera_id, 0):
+                self.camera_progress[camera_id] = progress
+                self.camera_last_growth[camera_id] = now
+                continue
+            idle_s = now - self.camera_last_growth.get(camera_id, now)
+            if idle_s >= RuntimeMonitor.CAMERA_STALL_S:
+                raise RuntimeError(
+                    f"PXCap {camera_id} 在等待按键期间已 {idle_s:.1f} 秒没有新帧"
+                )
+
+    def hand_age_s(self, now: float) -> float | None:
+        if self.hand_last_monotonic_ns is None:
+            return None
+        return max(
+            0.0,
+            now - self.hand_last_monotonic_ns / 1e9,
+        )
+
+    def sources_ready(self, now: float | None = None) -> bool:
+        """Quest selected pose + glove are genuinely live (camera-agnostic).
+
+        The cameras are started *after* this turns true, so this predicate must
+        not include them; otherwise the gate would wait for cameras it never
+        starts.
+        """
+        moment = time.monotonic() if now is None else now
+        quest_ok = self.poller is None or self.pose_watch.ready(
+            moment,
+            required_samples=self.required_samples,
+            fresh_s=READY_POSE_FRESH_S,
+        )
+        hand_age = self.hand_age_s(moment)
+        glove_ok = (
+            self.hand_collector.callback_count >= READY_GLOVE_FRAMES
+            and hand_age is not None
+            and hand_age <= READY_GLOVE_FRESH_S
+        )
+        return bool(quest_ok and glove_ok)
+
+    def cameras_ready(self, now: float | None = None) -> bool:
+        if not self.cameras:
+            return True
+        if not self.cameras_launched:
+            return False
+        if len(self.camera_first_at) != len(self.cameras):
+            return False
+        for camera in self.cameras:
+            camera.poll_health()
+        return True
+
+    def is_ready(self, now: float | None = None) -> bool:
+        moment = time.monotonic() if now is None else now
+        return bool(
+            self.sources_ready(moment) and self.cameras_ready(moment)
+        )
+
+    # -- cameras -----------------------------------------------------------
+    def launch_cameras(self) -> bool:
+        if self.cameras_launched or not self.cameras:
+            return True
+        for camera in self.cameras:
+            camera.start()
+            self.started_cameras.append(camera)
+            self.camera_started_at[camera.camera_id] = int(
+                camera.start_monotonic_ns
+            )
+        self.camera_first_at = wait_for_camera_first_frames(
+            self.cameras,
+            self.args.camera_start_timeout,
+        )
+        if not self.camera_first_at:
+            return False
+        self.cameras_launched = True
+        now = time.monotonic()
+        self.camera_progress = {
+            camera.camera_id: camera.progress_signal()
+            for camera in self.cameras
+        }
+        self.camera_last_growth = {
+            camera.camera_id: now for camera in self.cameras
+        }
+        for camera in self.cameras:
+            first = self.camera_first_at[camera.camera_id]
+            start = self.camera_started_at[camera.camera_id] / 1e9
+            log(
+                f"[INFO] PXCap {camera.camera_id} 已出帧："
+                f"启动后 {first - start:.2f} 秒"
+            )
+        # The wait blocked the main thread, so the Quest stream may hold up to
+        # five seconds of samples. Drain it, then require a *new* pose change:
+        # the samples drained here are all old, and a frozen controller must not
+        # look fresh because we happened to read it late.
+        self.refresh()
+        self.pose_watch.mark_stale()
+        return True
+
+    # -- status ------------------------------------------------------------
+    def report(self, now: float) -> None:
+        if now - self._last_report < READY_REPORT_S:
+            return
+        self._last_report = now
+        parts: list[str] = []
+        if self.poller is None:
+            parts.append("Quest：未配置")
+        elif self.pose_watch.samples == 0:
+            parts.append("Quest：尚未收到样本")
+        else:
+            age = self.pose_watch.age_s(now)
+            parts.append(
+                f"Quest {self.pose_watch.source_text}："
+                f"连续有效 {self.pose_watch.consecutive_valid}/"
+                f"{self.required_samples}，"
+                f"最近变化 {age:.1f} 秒前，累计 {self.pose_watch.samples} 样本"
+            )
+        hand_age = self.hand_age_s(now)
+        parts.append(
+            f"手套：{self.hand_collector.callback_count} 帧"
+            + (
+                f"，最近 {hand_age:.1f} 秒前"
+                if hand_age is not None
+                else "，尚未收到帧"
+            )
+        )
+        if self.cameras:
+            if not self.cameras_launched:
+                parts.append("相机：等 Quest/手套就绪后启动")
+            else:
+                ready_ids = ", ".join(
+                    sorted(self.camera_first_at)
+                ) or "无"
+                parts.append(f"相机：已出帧 {ready_ids}")
+        else:
+            parts.append("相机：未配置")
+        log("[等待就绪] " + "；".join(parts))
+
+    def print_ready(self) -> None:
+        log("=" * 68)
+        if self.poller is None:
+            log("[就绪] Quest：未配置（--no-quest）")
+        else:
+            age = self.pose_watch.age_s()
+            log(
+                f"[就绪] Quest {self.pose_watch.source_text}："
+                f"连续 {self.pose_watch.consecutive_valid} 帧有效位姿，"
+                f"最近 {age:.2f} 秒前更新"
+            )
+        hand_age = self.hand_age_s(time.monotonic())
+        log(
+            f"[就绪] 手套：{self.hand_collector.callback_count} 帧"
+            + (
+                f"，最近 {hand_age:.2f} 秒前"
+                if hand_age is not None
+                else ""
+            )
+        )
+        if not self.cameras:
+            log("[就绪] 相机：未配置")
+        else:
+            details = []
+            for camera in self.cameras:
+                first = self.camera_first_at[camera.camera_id]
+                start = self.camera_started_at[camera.camera_id] / 1e9
+                details.append(
+                    f"{camera.camera_id} 首帧 {first - start:.2f} 秒"
+                )
+            log("[就绪] 相机：" + "，".join(details) + "（启动后）")
+        log("=" * 68)
+        if self.args.no_wait:
+            log("准备完毕；已按 --no-wait 自动开始采集")
+        else:
+            log("准备完毕。按任意键开始采集（Ctrl+C 退出）")
+
+    # -- key / finish ------------------------------------------------------
+    def discard_pending(self) -> None:
+        """Throw away samples that arrived between the last poll and the key."""
+        if self.poller is not None:
+            for _sample in self.quest_stream.drain():
+                self.quest_discarded += 1
+        count, _last = drain_hand_frames(self.hand_collector)
+        self.hand_discarded += count
+
+    def finish(self, auto_start: bool) -> StartInfo:
+        self.discard_pending()
+        started_at = datetime.now().astimezone()
+        started_unix_ns = time.time_ns()
+        started_monotonic_ns = time.monotonic_ns()
+        ready_at = self.ready_at if self.ready_at is not None else (
+            started_monotonic_ns / 1e9
+        )
+        started_monotonic_s = started_monotonic_ns / 1e9
+        first_frame_s: dict[str, float] = {}
+        pre_roll_s: dict[str, float] = {}
+        for camera in self.cameras:
+            camera_id = camera.camera_id
+            first = self.camera_first_at.get(camera_id)
+            start = self.camera_started_at.get(camera_id)
+            if first is not None and start is not None:
+                first_frame_s[camera_id] = max(0.0, first - start / 1e9)
+                pre_roll_s[camera_id] = max(
+                    0.0, started_monotonic_s - first
+                )
+        return StartInfo(
+            started_at=started_at,
+            started_unix_ns=started_unix_ns,
+            started_monotonic_ns=started_monotonic_ns,
+            ready_wait_s=(
+                (ready_at - self.started)
+                if self.ready_at is not None
+                else 0.0
+            ),
+            key_wait_s=(
+                max(0.0, started_monotonic_s - ready_at)
+                if not auto_start
+                else 0.0
+            ),
+            auto_start=auto_start,
+            quest_discarded=self.quest_discarded,
+            hand_discarded=self.hand_discarded,
+            quest_min_sequence=(
+                self.poller.samples + 1 if self.poller is not None else None
+            ),
+            pose_watch=self.pose_watch,
+            camera_first_frame_s=first_frame_s,
+            camera_pre_roll_s=pre_roll_s,
+        )
+
+    def wait(self) -> StartInfo | None:
+        while True:
+            if STOP_EVENT.is_set():
+                return None
+            now = time.monotonic()
+            self.refresh(now)
+            # Cameras are started only after the Quest/glove sources are live.
+            # ``is_ready`` includes the cameras, so it cannot be the trigger for
+            # launching them (that would deadlock: cameras wait for ready, ready
+            # waits for cameras).
+            if (
+                self.cameras
+                and not self.cameras_launched
+                and self.sources_ready(now)
+            ):
+                if not self.launch_cameras():
+                    return None
+                now = time.monotonic()
+                self.refresh(now)
+            ready = self.is_ready(now)
+            if not ready:
+                if self.ready_logged:
+                    self.ready_logged = False
+                    log("[等待] 就绪状态丢失，撤回“准备完毕”，继续等待 ...")
+                self.report(now)
+                STOP_EVENT.wait(0.02)
+                continue
+            if not self.ready_logged:
+                self.ready_logged = True
+                self.ready_at = time.monotonic()
+                self.print_ready()
+            if self.args.no_wait:
+                return self.finish(auto_start=True)
+            outcome = read_start_key(
+                lambda: self.refresh() if not STOP_EVENT.is_set() else False
+            )
+            if outcome == "key":
+                return self.finish(auto_start=False)
+            if outcome == "abort":
+                return None
+            self.ready_logged = False
+            log("[等待] 按键前就绪状态丢失，撤回“准备完毕”，继续等待 ...")
+
+
+def quest_sample_is_valid(sample: dict[str, Any]) -> bool:
+    """Whether one SDK sample carries real tracking data.
+
+    A paused XRoboToolKit APK (headset locked or not worn) keeps the poll loop
+    alive but every getter returns its default: timestamp -1/0 and tracked
+    False. Those rows must not be mistaken for a healthy Quest source.
+    """
+    if bool(sample.get("tracked")):
+        return True
+    timestamp = sample.get("sdk_timestamp_ns")
+    return (
+        isinstance(timestamp, (int, float))
+        and not isinstance(timestamp, bool)
+        and math.isfinite(timestamp)
+        and timestamp > 0
+    )
+
+
 def quest_sample_to_row(
     sample: dict[str, Any],
     pose_source: str,
@@ -618,6 +1261,12 @@ class Hdf5Recorder:
         # Unix instant.
         self._first_quest_sdk_ns: int | None = None
         self._last_quest_sdk_ns: int | None = None
+        # The poller keeps counting through standby; the first recorded row is
+        # therefore not #1. Keep the value so the manifest can say where the
+        # recording segment starts without resetting a live thread's counter.
+        self._first_quest_sequence: int | None = None
+        self._last_quest_sequence: int | None = None
+        self.quest_valid_rows = 0
 
         self._cap_datasets: dict[str, h5py.Dataset] = {}
         self._quest_datasets: dict[str, h5py.Dataset] = {}
@@ -737,10 +1386,17 @@ class Hdf5Recorder:
 
     def write_quest(self, row: dict[str, Any]) -> None:
         sdk_ns = int(row.get("quest/sdk_timestamp_ns") or -1)
+        sequence = int(row.get("quest/sequence") or 0)
+        if sequence > 0:
+            if self._first_quest_sequence is None:
+                self._first_quest_sequence = sequence
+            self._last_quest_sequence = sequence
         if sdk_ns > 0:
             if self._first_quest_sdk_ns is None:
                 self._first_quest_sdk_ns = sdk_ns
             self._last_quest_sdk_ns = sdk_ns
+        if sdk_ns > 0 or bool(row.get("quest/tracked")):
+            self.quest_valid_rows += 1
         self._quest_pending.append(row)
         if len(self._quest_pending) >= self.flush_rows:
             self.flush_quest()
@@ -876,6 +1532,14 @@ class Hdf5Recorder:
     @property
     def quest_total(self) -> int:
         return self.quest_rows + len(self._quest_pending)
+
+    @property
+    def first_quest_sequence(self) -> int | None:
+        return self._first_quest_sequence
+
+    @property
+    def last_quest_sequence(self) -> int | None:
+        return self._last_quest_sequence
 
     @property
     def sample_span_s(self) -> float:
@@ -1214,17 +1878,26 @@ class QuestPoller(threading.Thread):
         self.period_s = 1.0 / rate_hz
         self.failure: Exception | None = None
         self.samples = 0
+        #: Samples that actually carried tracking data (not SDK defaults).
+        self.valid_samples = 0
         self.overruns = 0
 
     def run(self) -> None:
         next_deadline = time.monotonic()
         try:
             while not STOP_EVENT.is_set():
-                sequence = self.samples + 1
                 # 时间戳由 quest3.XrtReader.collect_sample 一并返回，这里只负责
                 # 入队，不追加任何主机侧时刻
-                self.stream.push(TimedSample(data=self.reader.collect_sample(sequence)))
-                self.samples += 1
+                sequence = self.samples + 1
+                # Count *before* the SDK call. The start gate reads this counter
+                # as the pre-key boundary: a sample whose collection began before
+                # the key is then below the gate's floor even if it is pushed
+                # after the gate's final drain.
+                self.samples = sequence
+                sample = self.reader.collect_sample(sequence)
+                if quest_sample_is_valid(sample):
+                    self.valid_samples += 1
+                self.stream.push(TimedSample(data=sample))
 
                 next_deadline += self.period_s
                 now = time.monotonic()
@@ -1272,6 +1945,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=120.0,
         help="Quest SDK 轮询频率，默认 120 Hz",
+    )
+    parser.add_argument(
+        "--quest-ready-samples",
+        type=int,
+        default=READY_QUEST_SAMPLES,
+        help=(
+            f"判定 Quest 就绪所需的连续有效选定位姿样本数，默认 "
+            f"{READY_QUEST_SAMPLES}；还要求最近 {READY_POSE_FRESH_S:g} 秒内"
+            "位姿有变化（防手柄休眠）"
+        ),
+    )
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help=(
+            "就绪后不等待按键，立即开始采集；用于非 TTY/自动化。"
+            "不加它时，stdin 不是终端会直接报错"
+        ),
     )
     parser.add_argument(
         "--pose-source",
@@ -1350,6 +2041,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--ffmpeg",
+        default="auto",
+        help=(
+            "ffmpeg 可执行文件路径；默认 auto = 先读 $FFMPEG，再在 PATH 里找。"
+            "必须 5.0 以上并带 -fps_mode（apt 的 22.04 版 4.4.2 不满足）"
+        ),
+    )
+    parser.add_argument(
         "--video-codec",
         choices=("copy", "h264", "hevc", "mjpeg"),
         default="copy",
@@ -1423,6 +2122,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adb", help="adb 可执行文件路径")
     parser.add_argument("--serial", help="Quest ADB 设备序列号")
     parser.add_argument("--quest-ip", help="Quest 局域网 IPv4 地址")
+    parser.add_argument(
+        "--quest-wireless",
+        action="store_true",
+        help=(
+            "优先用无线 ADB 连 Quest：mDNS 自动发现，需要时提示输入配对码；"
+            "失败再回退 USB。头显里先开启 Wireless debugging"
+        ),
+    )
     parser.add_argument("--adb-port", type=int, default=5555, help="无线 ADB 端口")
     parser.add_argument(
         "--allow-usb-only",
@@ -1463,6 +2170,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         )
     if not 0 < args.quest_rate <= 240:
         parser.error("--quest-rate 必须在 (0, 240] Hz 范围内")
+    if args.quest_ready_samples < 1:
+        parser.error("--quest-ready-samples 必须大于或等于 1")
     if args.duration < 0:
         parser.error("--duration 必须大于或等于 0")
     if args.camera_width <= 0 or args.camera_height <= 0:
@@ -1484,6 +2193,10 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--adb-port 必须在 1..65535 范围内")
     if args.no_quest and args.start_pc_service:
         parser.error("--no-quest 与 --start-pc-service 不能同时使用")
+    if args.no_quest and args.quest_wireless:
+        parser.error("--no-quest 与 --quest-wireless 不能同时使用")
+    if args.skip_adb and args.quest_wireless:
+        parser.error("--skip-adb 与 --quest-wireless 不能同时使用")
 
 
 def resolve_pose_side(cap_side: str, requested_pose_side: str) -> str:
@@ -1812,7 +2525,14 @@ def selected_camera_slots(args: argparse.Namespace) -> tuple[str, ...]:
     return ()
 
 
-def list_devices() -> int:
+def resolve_ffmpeg(argument: str | None) -> str | None:
+    """Turn the ``auto`` sentinel into None so ``find_ffmpeg`` walks $FFMPEG, then PATH."""
+    if argument is None or argument == "auto":
+        return None
+    return argument
+
+
+def list_devices(ffmpeg_argument: str | None = None) -> int:
     ports = discover_hand_ports()
 
     log("[INFO] USB/ACM 串口：")
@@ -1831,7 +2551,7 @@ def list_devices() -> int:
         log(f"  {node}")
 
     try:
-        ffmpeg = find_ffmpeg()
+        ffmpeg = find_ffmpeg(resolve_ffmpeg(ffmpeg_argument))
     except RuntimeError as exc:
         warn(str(exc))
         log("[INFO] ffmpeg：未找到")
@@ -1862,10 +2582,12 @@ def handle_stop_signal(signum: int, _frame: Any) -> None:
 class RuntimeMonitor:
     """Health checks for the sources that are actually configured.
 
-    Replaces the startup readiness trackers. A configured source has to keep
-    producing data for the whole session: the first frame gets a grace period
-    (a UVC camera needs a moment before it delivers anything, and the headset
-    needs time to come up), after which a stall or a dead process ends the run.
+    Complements :class:`StartGate`: the gate decides when recording starts
+    (real selected pose + real glove frames + camera first frames + a key), and
+    this monitor keeps checking those same sources while rows are being
+    written. A configured source has to keep producing data for the whole
+    session: a dead process, a stalled camera, a frozen selected pose or a
+    stalled glove all end the run through the normal shutdown path.
 
     Every failure goes through :func:`abort_recording`, which signals
     ``STOP_EVENT`` instead of raising, so the normal shutdown path still drains
@@ -1874,6 +2596,11 @@ class RuntimeMonitor:
 
     Only configured sources are checked: with ``--camera-mode none`` the camera
     list is empty, and ``--no-quest`` never creates a poller in the first place.
+
+    A live poll loop is not enough for Quest: a locked/not-worn headset pauses
+    the APK while the SDK keeps returning default values. ``valid_samples`` is
+    checked separately so those all-zero rows end the run instead of looking
+    like a healthy source.
     """
 
     PROCESS_CHECK_S = 1.0
@@ -1883,12 +2610,19 @@ class RuntimeMonitor:
     GLOVE_STALL_S = 3.0
     #: A pull loop that stops returning samples is stuck inside an SDK call.
     QUEST_POLL_STALL_S = 5.0
+    #: The headset needs time to come up before its silence is a failure.
+    QUEST_VALID_GRACE_S = 10.0
+    #: Once valid tracking was seen, this long without any ends the run.
+    QUEST_VALID_STALL_S = 5.0
 
     def __init__(
         self,
         cameras: Sequence[FfmpegCamera] = (),
         poller: QuestPoller | None = None,
         camera_grace_s: float = 15.0,
+        pose_source: str | None = None,
+        pose_side: str | None = None,
+        camera_first_frame_s: dict[str, float] | None = None,
     ) -> None:
         self.cameras = list(cameras)
         self.poller = poller
@@ -1896,15 +2630,45 @@ class RuntimeMonitor:
         self.started = time.monotonic()
         self._next_process = self.started
         self._next_frames = self.started
-        self._progress = {camera.camera_id: 0 for camera in self.cameras}
+        # The old flow created this monitor right after camera.start(), so 0 was
+        # the correct baseline. The start gate creates it after the cameras have
+        # already delivered their first frame and passes ``camera_first_frame_s``;
+        # in that case seed the current progress instead of re-announcing it.
+        seed_progress = bool(camera_first_frame_s)
+        self._progress = {
+            camera.camera_id: (
+                camera.progress_signal() if seed_progress else 0
+            )
+            for camera in self.cameras
+        }
         self._last_growth = {camera.camera_id: self.started for camera in self.cameras}
-        #: camera_id -> seconds since start when its first frame showed up
-        self.first_frame_s: dict[str, float] = {}
+        #: camera_id -> seconds from camera.start() to its first frame. Seeded by
+        #: the start gate, because the cameras were already running when this
+        #: monitor was created; otherwise the first 0.5 Hz probe would record a
+        #: fake "first frame after 2 s of session".
+        self.first_frame_s: dict[str, float] = dict(camera_first_frame_s or {})
         self.camera_stalls = 0
         self.glove_gaps = 0
         self._last_cap = self.started
         self._quest_samples = int(getattr(poller, "samples", 0)) if poller else 0
         self._quest_last_growth = self.started
+        self._quest_valid = int(getattr(poller, "valid_samples", 0)) if poller else 0
+        self._quest_last_valid = self.started
+        self.quest_valid_grace_s = self.QUEST_VALID_GRACE_S
+        #: Selected-pose watch for T3: the OR-ed ``tracked`` flag hides a
+        #: sleeping controller, the selected pose values do not.
+        self.pose_watch: SelectedPoseWatch | None = (
+            SelectedPoseWatch(pose_source, pose_side)
+            if poller is not None and pose_source is not None
+            else None
+        )
+        self.pose_stale_warnings = 0
+        self.pose_stale_max_s = 0.0
+
+    def note_quest(self, sample: dict[str, Any]) -> None:
+        """Feed one *written* Quest sample to the selected-pose watch."""
+        if self.pose_watch is not None:
+            self.pose_watch.update(sample)
 
     def note_cap(self) -> None:
         """Record that the capture loop just received a glove frame."""
@@ -1939,16 +2703,63 @@ class RuntimeMonitor:
         # is not used here.
         now = time.monotonic()
         samples = int(getattr(poller, "samples", 0))
+        valid = int(getattr(poller, "valid_samples", 0))
+        if valid > self._quest_valid:
+            self._quest_valid = valid
+            self._quest_last_valid = now
         if samples > self._quest_samples:
             self._quest_samples = samples
             self._quest_last_growth = now
-            return
-        idle_s = now - self._quest_last_growth
-        if idle_s >= self.QUEST_POLL_STALL_S:
-            abort_recording(
-                f"Quest 轮询已 {idle_s:.1f} 秒没有返回样本"
-                "（线程卡在 SDK 调用里，或 PC Service 不再应答）"
-            )
+        else:
+            idle_s = now - self._quest_last_growth
+            if idle_s >= self.QUEST_POLL_STALL_S:
+                abort_recording(
+                    f"Quest 轮询已 {idle_s:.1f} 秒没有返回样本"
+                    "（线程卡在 SDK 调用里，或 PC Service 不再应答）"
+                )
+                return
+
+        # Samples can keep arriving while every getter returns its default: the
+        # headset is locked/not worn and the APK is paused. That looks like a
+        # healthy poll loop, so the payload has to be checked separately.
+        if self._quest_valid == 0:
+            waited_s = now - self.started
+            if waited_s >= self.QUEST_VALID_GRACE_S:
+                abort_recording(
+                    f"Quest 已连接但 {waited_s:.1f} 秒内没有任何有效 tracking 数据"
+                    "（戴上并解锁头显、让 APK 保持前台，开启 Tracking 和 Send）"
+                )
+                return
+        else:
+            idle_s = now - self._quest_last_valid
+            if idle_s >= self.QUEST_VALID_STALL_S:
+                abort_recording(
+                    f"Quest 已 {idle_s:.1f} 秒没有有效 tracking 数据"
+                    "（头显是否被摘下/锁屏，或 APK 被切到后台）"
+                )
+                return
+
+        # T3: the selected pose can stop updating while the rest of the headset
+        # keeps streaming (controller asleep/lost tracking). ``valid_samples``
+        # stays healthy because the head is still tracked, so only the pose
+        # value itself can expose this. Reading the same 7 numbers for seconds
+        # is not a still hand: real tracking has sub-millimetre noise.
+        watch = self.pose_watch
+        if watch is not None and watch.samples > 0:
+            age = watch.age_s(now)
+            self.pose_stale_max_s = max(self.pose_stale_max_s, age)
+            if age >= QUEST_POSE_STALE_WARN_S and not watch.stale_warned:
+                watch.stale_warned = True
+                self.pose_stale_warnings += 1
+                warn(
+                    f"Quest {watch.source_text} 选定位姿已 {age:.1f} 秒没有更新"
+                    "（手柄休眠/丢失追踪？请拿动手柄）"
+                )
+            if age >= QUEST_POSE_STALE_ABORT_S:
+                abort_recording(
+                    f"Quest {watch.source_text} 选定位姿已 {age:.1f} 秒没有更新"
+                    "（手柄休眠/丢失追踪）；本次中止"
+                )
 
     def _check_frames(self, now: float) -> None:
         """One rule for "never produced a frame" and "stopped producing".
@@ -2004,6 +2815,7 @@ def pump_and_record(
     final: bool = False,
     view: Any | None = None,
     monitor: RuntimeMonitor | None = None,
+    quest_min_sequence: int | None = None,
 ) -> None:
     """Move both queues into the HDF5, each on its own row axis.
 
@@ -2022,8 +2834,35 @@ def pump_and_record(
     while True:
         if deadline is not None and time.monotonic() >= deadline:
             STOP_EVENT.set()
-        if monitor is not None:
+
+        # Drain Quest *before* the monitor's T3 check. The main thread can be
+        # blocked for a while (HDF5 batch, live view); if the check ran first it
+        # would see the pre-block pose and abort on a stale age even though the
+        # newly queued samples prove the pose is alive.
+        for sample in quest_stream.drain():
+            sequence = int(sample.data.get("sequence") or 0)
+            if (
+                quest_min_sequence is not None
+                and sequence < quest_min_sequence
+            ):
+                # Collected before the key, pushed after the gate's drain.
+                continue
+            if monitor is not None and not final:
+                monitor.note_quest(sample.data)
+            recorder.write_quest(
+                quest_sample_to_row(
+                    sample.data,
+                    recorder.pose_source,
+                    recorder.pose_side,
+                    recorder.joint_capacity,
+                )
+            )
+
+        if monitor is not None and not final:
+            # The final drain runs after STOP_EVENT; a late T3/camera probe
+            # there would only add noise to an already-decided shutdown.
             monitor.poll()
+
         if STOP_EVENT.is_set():
             if not final:
                 break
@@ -2034,6 +2873,12 @@ def pump_and_record(
                 if pending > 0:
                     warn(f"停止时手套队列仍有约 {pending} 帧未写入")
                 for sample in quest_stream.drain():
+                    sequence = int(sample.data.get("sequence") or 0)
+                    if (
+                        quest_min_sequence is not None
+                        and sequence < quest_min_sequence
+                    ):
+                        continue
                     recorder.write_quest(
                         quest_sample_to_row(
                             sample.data,
@@ -2043,16 +2888,6 @@ def pump_and_record(
                         )
                     )
                 break
-
-        for sample in quest_stream.drain():
-            recorder.write_quest(
-                quest_sample_to_row(
-                    sample.data,
-                    recorder.pose_source,
-                    recorder.pose_side,
-                    recorder.joint_capacity,
-                )
-            )
 
         try:
             hand = hand_collector.frames.get(timeout=0.05)
@@ -2089,6 +2924,10 @@ def environment_info(ffmpeg: str | None) -> dict[str, Any]:
         info["ffmpeg"] = ffmpeg_version(ffmpeg)
         info["ffmpeg_path"] = ffmpeg
     return info
+
+
+class StartAborted(RuntimeError):
+    """The user cancelled the standby gate; no ``data.h5`` was created."""
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2134,7 +2973,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     ABORT_REASON = None
 
     if args.list_devices:
-        return list_devices()
+        return list_devices(args.ffmpeg)
+
+    if not args.no_wait and not sys.stdin.isatty():
+        error(
+            "需要按任意键开始采集，但 stdin 不是终端（nohup/管道/重定向）。"
+            "请直接在终端运行，或加 --no-wait 让它就绪后自动开始"
+        )
+        return 2
 
     reader: XrtReader | None = None
     poller: QuestPoller | None = None
@@ -2154,6 +3000,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     startup_error: Exception | None = None
     session_started_at = datetime.now().astimezone()
     started_monotonic_ns = time.monotonic_ns()
+    start_info: StartInfo | None = None
     output_dir = make_output_dir(args.output_dir)
     output_dir_preexisting = output_dir.exists()
     camera_slots = selected_camera_slots(args)
@@ -2179,7 +3026,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 maybe_start_pc_service(args)
                 if not args.skip_adb:
-                    quest_setup = prepare_quest(args, keep_usb_adb=True)
+                    quest_setup = prepare_quest(
+                        args,
+                        keep_usb_adb=True,
+                        prefer_wireless=args.quest_wireless,
+                    )
                     log(
                         f"[INFO] Quest ADB 已就绪：{quest_setup.serial} "
                         f"({'无线' if quest_setup.wireless else 'USB'})"
@@ -2211,7 +3062,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ) from exc
 
         if camera_slots:
-            ffmpeg = find_ffmpeg()
+            ffmpeg = find_ffmpeg(resolve_ffmpeg(args.ffmpeg))
             needs_discovery = any(
                 (args.camera_0 if slot == "cam0" else args.camera_1) == "auto"
                 for slot in camera_slots
@@ -2232,35 +3083,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
 
-        hand_collector = HandCollector(
-            resolved_hand_port,
-            args.hand_rate,
-            not args.omit_distribution,
-        )
-        hand_collector.connect()
-        # 先出数再建文件：data.h5 一旦存在就说明手套确实在跑，不存在
-        # 「启动失败但留下空文件」的中间态。
-        hand_collector.start()
-
+        # The output dir must exist before camera.open(): open() clears stale
+        # progress/log files under cameras/, and create_output_dir() refuses to
+        # reuse an existing directory.
         create_output_dir(output_dir)
-
-        recorder = Hdf5Recorder(
-            output_dir,
-            args.pose_source,
-            args.pose_side,
-            args.cap_side,
-            camera_ids,
-            not args.omit_distribution,
-        )
-        recorder.__enter__()
-        recorder_entered = True
-        global ACTIVE_RECORDER
-        ACTIVE_RECORDER = recorder
-        log(f"[INFO] 数据写入：{output_dir}")
 
         if camera_slots:
             camera_dir = output_dir / "cameras"
-            camera_dir.mkdir(parents=True, exist_ok=True)
             cameras = [
                 FfmpegCamera(
                     camera_id,
@@ -2279,22 +3108,82 @@ def main(argv: Sequence[str] | None = None) -> int:
             for camera in cameras:
                 try:
                     camera.open()
-                    camera.start()
-                    started_cameras.append(camera)
                 except Exception as exc:
                     camera_errors[camera.camera_id] = str(exc)
-                    error(f"PXCap {camera.camera_id} 摄像头启动失败：{exc}")
-            # 配了几路就要有几路：少一路的采集在训练侧等于整份作废，所以这里
-            # 不降级，直接按启动失败收场。只要录一路，用 --camera-mode cam0。
-            if len(started_cameras) != len(cameras):
+                    error(f"PXCap {camera.camera_id} 摄像头打开失败：{exc}")
+            if camera_errors:
                 raise RuntimeError(
-                    "摄像头启动失败，本次配置要求全部在录："
+                    "摄像头打开失败，本次配置要求全部在录："
                     + "；".join(
                         f"{camera_id}: {reason}"
                         for camera_id, reason in camera_errors.items()
                     )
                     + "（只录一路请用 --camera-mode cam0 / cam1）"
                 )
+
+        hand_collector = HandCollector(
+            resolved_hand_port,
+            args.hand_rate,
+            not args.omit_distribution,
+        )
+        hand_collector.connect()
+        hand_collector.start()
+
+        # Standby gate: real Quest selected pose + real glove frames -> start
+        # cameras and wait for their first frames -> print "ready" -> wait for
+        # a key. The cameras record a pre-roll before the key; Quest/glove
+        # standby samples are discarded; data.h5 is created only at the key.
+        gate = StartGate(
+            args,
+            poller if poller_started else None,
+            quest_stream,
+            hand_collector,
+            cameras,
+            started_cameras,
+        )
+        log(
+            "[INFO] 等待就绪：Quest 选定位姿 + 手套真实出帧；"
+            "就绪后启动相机并等首帧，然后按键开始"
+        )
+        start_info = gate.wait()
+        if start_info is None:
+            raise StartAborted("用户在就绪前按 Ctrl+C 中止，未生成 data.h5")
+
+        # --duration is from the key, not from "after the recorder/view/monitor
+        # are set up"; the post-key setup can take a visible amount of time.
+        deadline = (
+            start_info.started_monotonic_ns / 1e9 + args.duration
+            if args.duration > 0.0
+            else None
+        )
+
+        recorder = Hdf5Recorder(
+            output_dir,
+            args.pose_source,
+            args.pose_side,
+            args.cap_side,
+            camera_ids,
+            not args.omit_distribution,
+        )
+        recorder.__enter__()
+        recorder_entered = True
+        # The final drain in ``finally`` uses this for its progress log; set it
+        # before anything that can fail, not only after the monitor is built.
+        started_monotonic_ns = start_info.started_monotonic_ns
+        global ACTIVE_RECORDER
+        ACTIVE_RECORDER = recorder
+        log(f"[INFO] 数据写入：{output_dir}")
+        log(
+            f"[INFO] 按键开始：就绪等待 {start_info.ready_wait_s:.1f} s，"
+            f"按键等待 {start_info.key_wait_s:.1f} s；"
+            f"丢弃待机 Quest {start_info.quest_discarded} 个样本 / "
+            f"手套 {start_info.hand_discarded} 帧"
+        )
+        for camera_id, pre_roll in start_info.camera_pre_roll_s.items():
+            log(
+                f"[INFO] {camera_id} 预录 {pre_roll:.2f} s"
+                "（按键前相机已在录，下游 Align 按公共窗口丢弃）"
+            )
 
         if args.view:
             try:
@@ -2344,6 +3233,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             started_cameras,
             poller if poller_started else None,
             camera_grace_s=args.camera_start_timeout,
+            pose_source=args.pose_source,
+            pose_side=args.pose_side,
+            camera_first_frame_s=start_info.camera_first_frame_s,
         )
         checked = ["手套"]
         if started_cameras:
@@ -2356,13 +3248,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "[INFO] 运行期检查已启用："
             + " / ".join(checked)
             + f"；相机出帧 0.5 Hz、停滞 {RuntimeMonitor.CAMERA_STALL_S:g} s 即中止，"
-            f"手套停滞 {RuntimeMonitor.GLOVE_STALL_S:g} s 即中止"
+            f"手套停滞 {RuntimeMonitor.GLOVE_STALL_S:g} s 即中止，"
+            f"Quest 选定位姿冻结 {QUEST_POSE_STALE_ABORT_S:g} s 即中止"
         )
-        started_monotonic_ns = time.monotonic_ns()
-        deadline = (
-            time.monotonic() + args.duration if args.duration > 0.0 else None
-        )
-        log("开始采集：手套/相机/Quest 各自启动、互不等待，按 Ctrl+C 停止")
+        log("开始采集：手套/相机/Quest 已就绪，按键后同时记录；按 Ctrl+C 停止")
         while not STOP_EVENT.is_set():
             pump_and_record(
                 recorder,
@@ -2372,8 +3261,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 deadline,
                 view=live_view,
                 monitor=monitor,
+                quest_min_sequence=start_info.quest_min_sequence,
             )
 
+    except StartAborted as exc:
+        startup_error = exc
+        exit_code = 130
+        log(str(exc))
     except (QuestSetupError, RuntimeError, OSError, ImportError) as exc:
         startup_error = exc
         error(str(exc))
@@ -2404,6 +3298,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 started_monotonic_ns,
                 final=True,
                 view=live_view,
+                quest_min_sequence=(
+                    start_info.quest_min_sequence
+                    if start_info is not None
+                    else None
+                ),
             )
         if poller is not None and poller_started:
             log("[INFO] 停止 Quest SDK 轮询 ...")
@@ -2487,16 +3386,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if first is None:
                         continue
                     gap_s = (first - cap_first) / 1e9
-                    if abs(gap_s) > SESSION_START_TOLERANCE_S:
+                    if gap_s > SESSION_START_TOLERANCE_S:
                         warn(
-                            f"{camera_id} 首帧与手套首帧相差 {gap_s:+.1f} 秒，"
-                            "两者可能不在同一段录制里（仅提示，文件里不做对齐）"
+                            f"{camera_id} 首帧比手套首帧晚 {gap_s:+.1f} 秒，"
+                            "相机没覆盖到录制开头（仅提示，文件里不做对齐）"
+                        )
+                    elif -gap_s > CAMERA_PRE_ROLL_WARN_S:
+                        warn(
+                            f"{camera_id} 预录 {-gap_s:.1f} 秒，"
+                            f"超过预期上限 {CAMERA_PRE_ROLL_WARN_S:g} 秒"
                         )
                 # Quest 只剩 SDK 时间戳，域未知，无法与手套的单调钟比较，
                 # 因此这里不做覆盖检查；两路是否同场只能靠行数是否都非 0 粗判。
                 # --no-quest 时 quest 组本来就是 0 行，别报一条假警告。
                 if not args.no_quest and recorder.quest_rows == 0:
                     warn("本次没有采到任何 Quest 样本（quest 组为 0 行）")
+                if (
+                    not args.no_quest
+                    and recorder.quest_rows > 0
+                    and recorder.quest_valid_rows == 0
+                    and startup_error is None
+                ):
+                    reason = (
+                        "Quest 样本全部无效（sdk_timestamp_ns 全为 -1、tracked 全为 false）；"
+                        "戴上并解锁头显、让 APK 保持前台并开启 Tracking/Send 后重采"
+                    )
+                    error(reason)
+                    startup_error = RuntimeError(reason)
+                    exit_code = 2
 
             verify = recorder.verify_rows()
             if verify["row_mismatch"]:
@@ -2519,6 +3436,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hand_mono_window = recorder.cap_window_monotonic_ns()
             quest_sdk_window = recorder.quest_window_sdk_ns()
             camera_first_frame = monitor.first_frame_s if monitor else {}
+            cap_first = cap_window[0] if cap_window is not None else None
             camera_metadata: dict[str, Any] = {}
             for camera_id in camera_ids:
                 entry: dict[str, Any] = {
@@ -2560,6 +3478,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                             ),
                         }
                     )
+                    first_unix = info.get("first_timestamp_unix_ns")
+                    entry["pre_roll_s"] = (
+                        round(
+                            (
+                                start_info.started_unix_ns
+                                - int(first_unix)
+                            )
+                            / 1e9,
+                            3,
+                        )
+                        if start_info is not None
+                        and first_unix is not None
+                        and int(first_unix) < start_info.started_unix_ns
+                        else 0.0
+                    )
                 camera_metadata[camera_id] = entry
 
             metadata = {
@@ -2582,6 +3515,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "callback_mean_ms": hand_collector.callback_mean_ms,
                     "callback_max_ms": hand_collector.callback_max_ms,
                     "distribution_included": not args.omit_distribution,
+                    "standby_frames_discarded": (
+                        start_info.hand_discarded if start_info else 0
+                    ),
                     "first_timestamp_unix_ns": (
                         hand_window[0] if hand_window else None
                     ),
@@ -2617,6 +3553,54 @@ def main(argv: Sequence[str] | None = None) -> int:
                         else None
                     ),
                     "rows": recorder.quest_rows,
+                    "valid_rows": recorder.quest_valid_rows,
+                    "first_sequence": recorder.first_quest_sequence,
+                    "last_sequence": recorder.last_quest_sequence,
+                    "standby_samples_discarded": (
+                        start_info.quest_discarded if start_info else 0
+                    ),
+                    "selected_pose": {
+                        "source": args.pose_source,
+                        "side": (
+                            None
+                            if args.pose_source == "head"
+                            else args.pose_side
+                        ),
+                        "required_consecutive_samples": args.quest_ready_samples,
+                        "fresh_within_s": READY_POSE_FRESH_S,
+                        "stale_warn_s": QUEST_POSE_STALE_WARN_S,
+                        "stale_abort_s": QUEST_POSE_STALE_ABORT_S,
+                        "standby_changes": (
+                            start_info.pose_watch.changes
+                            if start_info is not None
+                            else 0
+                        ),
+                        "runtime_samples": (
+                            monitor.pose_watch.samples
+                            if monitor is not None and monitor.pose_watch is not None
+                            else 0
+                        ),
+                        "runtime_valid_samples": (
+                            monitor.pose_watch.valid_samples
+                            if monitor is not None and monitor.pose_watch is not None
+                            else 0
+                        ),
+                        "runtime_changes": (
+                            monitor.pose_watch.changes
+                            if monitor is not None and monitor.pose_watch is not None
+                            else 0
+                        ),
+                        "stale_max_s": (
+                            round(monitor.pose_stale_max_s, 3)
+                            if monitor is not None
+                            else 0.0
+                        ),
+                        "stale_warnings": (
+                            monitor.pose_stale_warnings
+                            if monitor is not None
+                            else 0
+                        ),
+                    },
                     "samples_dropped": quest_stream.dropped,
                     "setup_adb_skipped": args.skip_adb,
                     "apk_package": args.package,
@@ -2668,8 +3652,65 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "camera_frame_check_hz": 1.0 / RuntimeMonitor.FRAME_CHECK_S,
                     "camera_stall_limit_s": RuntimeMonitor.CAMERA_STALL_S,
                     "glove_stall_limit_s": RuntimeMonitor.GLOVE_STALL_S,
+                    "quest_valid_grace_s": RuntimeMonitor.QUEST_VALID_GRACE_S,
+                    "quest_valid_stall_limit_s": RuntimeMonitor.QUEST_VALID_STALL_S,
+                    "quest_pose_fresh_s": READY_POSE_FRESH_S,
+                    "quest_pose_stale_warn_s": QUEST_POSE_STALE_WARN_S,
+                    "quest_pose_stale_limit_s": QUEST_POSE_STALE_ABORT_S,
+                    "quest_pose_stale_warnings": (
+                        monitor.pose_stale_warnings if monitor else 0
+                    ),
                     "camera_stalls": monitor.camera_stalls if monitor else 0,
                     "glove_stalls": monitor.glove_gaps if monitor else 0,
+                },
+                "session": {
+                    "started_at": (
+                        start_info.started_at.isoformat(
+                            timespec="milliseconds"
+                        )
+                        if start_info is not None
+                        else None
+                    ),
+                    "started_unix_ns": (
+                        start_info.started_unix_ns
+                        if start_info is not None
+                        else None
+                    ),
+                    "started_monotonic_ns": (
+                        start_info.started_monotonic_ns
+                        if start_info is not None
+                        else None
+                    ),
+                    "process_started_at": session_started_at.isoformat(
+                        timespec="milliseconds"
+                    ),
+                    "ready_wait_s": (
+                        round(start_info.ready_wait_s, 3)
+                        if start_info is not None
+                        else None
+                    ),
+                    "key_wait_s": (
+                        round(start_info.key_wait_s, 3)
+                        if start_info is not None
+                        else None
+                    ),
+                    "auto_start": (
+                        bool(start_info.auto_start)
+                        if start_info is not None
+                        else False
+                    ),
+                    "standby": {
+                        "quest_samples_discarded": (
+                            start_info.quest_discarded
+                            if start_info is not None
+                            else 0
+                        ),
+                        "hand_frames_discarded": (
+                            start_info.hand_discarded
+                            if start_info is not None
+                            else 0
+                        ),
+                    },
                 },
                 "verify": verify,
                 "env": environment_info(ffmpeg),
@@ -2693,6 +3734,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "hand",
                         "quest",
                         "cameras",
+                        "session",
                         "runtime",
                         "verify",
                         "env",

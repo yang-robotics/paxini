@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Launch XRoboToolKit on Quest 3 and print tracking data received on the PC.
 
-The script first prepares the Quest through USB ADB, switches ADB to TCP mode,
-then reads head, controller, and hand data through XRoboToolkit PC Service and
-its Python SDK. The XRoboToolKit APK must remain open with tracking and data
-sending enabled.
+The script first prepares the Quest through USB ADB (or pairs/connects a
+wireless ADB session via mDNS), then reads head, controller, and hand data
+through XRoboToolkit PC Service and its Python SDK. The XRoboToolKit APK must
+remain open with tracking and data sending enabled.
 
-Shared with Paxini-Dex (``Dex_Quest``) except for ``collect_sample``: this copy
-also returns ``body_timestamp_ns`` / ``motion_timestamp_ns`` /
-``body_joints_timestamp_ns`` for the recorder, and drops the host-side
-``received_at`` field that Dex still prints.
+Shared with Paxini-Dex (``Dex_Quest``) up to ``collect_sample``; Cap has since
+diverged: this copy also returns ``body_timestamp_ns`` /
+``motion_timestamp_ns`` / ``body_joints_timestamp_ns`` for the recorder, drops
+the Dex ``received_at`` field, and adds the wireless ADB pairing/mDNS flow
+(``pair_and_connect``) plus ``pc_service_command()`` that Dex does not have.
 
 ``XrtReader.collect_sample`` returns four SDK-provided timestamps and nothing
 else that looks like a clock: ``sdk_timestamp_ns`` (``get_time_stamp_ns``),
@@ -36,7 +37,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -79,6 +80,52 @@ def warn(message: str) -> None:
 
 def error(message: str) -> None:
     print(f"[错误] {message}", file=sys.stderr, flush=True)
+
+
+def parse_mdns_services(text: str) -> dict[str, list[tuple[str, int]]]:
+    """Parse ``adb mdns services`` output into connect/pairing endpoints.
+
+    Each data line looks like ``adb-XXXX\t_adb-tls-connect._tcp\tHOST:PORT``;
+    adb versions differ in whitespace, so split on runs of whitespace and keep
+    the last token as the endpoint.
+    """
+    endpoints: dict[str, list[tuple[str, int]]] = {"connect": [], "pairing": []}
+    for line in text.splitlines():
+        parts = line.split()
+        service = next((part for part in parts if part.startswith("_adb-tls-")), None)
+        if service is None:
+            continue
+        host, _, port_text = parts[-1].rpartition(":")
+        if not host:
+            continue
+        try:
+            port = int(port_text)
+        except ValueError:
+            continue
+        if service.startswith("_adb-tls-connect"):
+            key = "connect"
+        elif service.startswith("_adb-tls-pairing"):
+            key = "pairing"
+        else:
+            continue
+        if (host, port) not in endpoints[key]:
+            endpoints[key].append((host, port))
+    return endpoints
+
+
+def is_wireless_serial(serial: str) -> bool:
+    """ADB serials for wireless transports: ``host:port`` or mDNS ``*.tcp`` names."""
+    return ":" in serial or serial.endswith("._tcp")
+
+
+def interactive_ask(prompt: str) -> str:
+    """Read one line from the terminal; refuse to guess when stdin is not a TTY."""
+    if not sys.stdin.isatty():
+        raise QuestSetupError(
+            "无线配对需要交互输入，但当前 stdin 不是终端；"
+            "请直接在终端运行，或先手动 adb pair"
+        )
+    return input(prompt).strip()
 
 
 def ask_to_unplug() -> None:
@@ -185,6 +232,196 @@ class QuestAdb:
             "与电脑位于同一局域网，并允许 adb 调试。"
         )
 
+    def mdns_services(self) -> dict[str, list[tuple[str, int]]]:
+        """Discover paired/connectable and pairable ADB endpoints via mDNS."""
+        result = self.run(["mdns", "services"], check=False, timeout=10.0)
+        return parse_mdns_services(
+            (result.stdout or "") + "\n" + (result.stderr or "")
+        )
+
+    @staticmethod
+    def local_ipv4_prefixes() -> list[str]:
+        """Return ``a.b.c.`` prefixes of this host's IPv4 networks."""
+        try:
+            result = subprocess.run(
+                ["ip", "-4", "-o", "addr", "show"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        return [
+            f"{match.group(1)}."
+            for match in re.finditer(
+                r"inet (\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}/", result.stdout
+            )
+        ]
+
+    def ip_on_local_network(self, ip: str | None) -> bool:
+        """Whether ``ip`` is worth a legacy ``adb connect`` attempt."""
+        if not ip:
+            return False
+        prefixes = self.local_ipv4_prefixes()
+        return not prefixes or any(ip.startswith(prefix) for prefix in prefixes)
+
+    def wireless_candidates(self, saved_ip: str | None) -> list[tuple[str, int]]:
+        """Connect endpoints worth trying, saved IP first, then the legacy port."""
+        services = self.mdns_services()
+        candidates: list[tuple[str, int]] = []
+        for host, port in services["connect"]:
+            if saved_ip and host == saved_ip:
+                candidates.append((host, port))
+        for host, port in services["connect"]:
+            if (host, port) not in candidates:
+                candidates.append((host, port))
+        # Only try the old fixed port when the saved IP is on a local subnet; a
+        # stale IP from another network would otherwise stall for the full timeout.
+        if saved_ip and self.ip_on_local_network(saved_ip):
+            legacy = (saved_ip, self.adb_port)
+            if legacy not in candidates:
+                candidates.append(legacy)
+        return candidates
+
+    def connect_wireless_candidate(
+        self,
+        host: str,
+        port: int,
+        wait_seconds: float = 4.0,
+    ) -> str | None:
+        """Try one wireless endpoint; return the serial when it reaches ``device``."""
+        serial = f"{host}:{port}"
+        if self.state(serial) == "device":
+            log(f"[INFO] 复用无线 ADB：{serial}")
+            self._save_ip(host)
+            return serial
+        log(f"[INFO] 尝试无线 ADB：{serial}")
+        try:
+            self.run(["connect", serial], check=False, timeout=5.0)
+        except QuestSetupError as exc:
+            warn(f"无线 ADB 连接失败：{exc}")
+            return None
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline and not STOP_EVENT.is_set():
+            if self.state(serial) == "device":
+                self._save_ip(host)
+                return serial
+            time.sleep(0.5)
+        return None
+
+    def pair_and_connect(
+        self,
+        saved_ip: str | None = None,
+        ask: Callable[[str], str] = interactive_ask,
+    ) -> str:
+        """Connect over wireless ADB, pairing only when the headset asks for it.
+
+        Already-authorized connections are tried first. When pairing is needed,
+        the code comes from the headset screen; ports are discovered over mDNS
+        and only asked for when mDNS exposes nothing.
+        """
+        for serial, state in self.devices().items():
+            if state == "device" and is_wireless_serial(serial):
+                ip = serial.rsplit(":", 1)[0] if ":" in serial else self.detect_quest_ip(serial)
+                if ip:
+                    self._save_ip(ip)
+                log(f"[INFO] 复用已连接的无线 ADB：{serial}")
+                return serial
+
+        for host, port in self.wireless_candidates(saved_ip):
+            serial = self.connect_wireless_candidate(host, port)
+            if serial is not None:
+                return serial
+
+        pairing = list(self.mdns_services()["pairing"])
+        if saved_ip:
+            pairing.sort(key=lambda item: item[0] != saved_ip)
+        if pairing:
+            host, port = pairing[0]
+            log(f"[INFO] 发现 Quest 配对服务：{host}:{port}")
+        else:
+            host, port = self._ask_pairing_endpoint(ask)
+            # The user may already be paired and only lacking mDNS; a connect to
+            # the endpoint shown in the headset is cheap and needs no code.
+            serial = self.connect_wireless_candidate(host, port)
+            if serial is not None:
+                return serial
+
+        code = ask(f"输入头显上显示的 6 位配对码（{host}:{port}）: ").strip()
+        if not code:
+            raise QuestSetupError("配对码为空，已中止无线配对")
+        log(f"[INFO] 正在与 {host}:{port} 配对 ...")
+        # quiet: the pairing code must not end up in the terminal transcript.
+        try:
+            result = self.run(
+                ["pair", f"{host}:{port}", code],
+                check=False,
+                quiet=True,
+                timeout=60.0,
+            )
+        except QuestSetupError:
+            raise QuestSetupError(
+                "adb pair 超时或失败；确认配对码和端口来自同一块头显屏幕"
+            ) from None
+        if "successfully paired" not in (result.stdout + result.stderr).lower():
+            raise QuestSetupError(
+                "adb pair 未返回 Successfully paired；确认配对码和端口来自同一块"
+                "头显屏幕且没有过期"
+            )
+
+        log("[INFO] 配对成功，等待无线 ADB 端口就绪 ...")
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not STOP_EVENT.is_set():
+            for candidate_host, candidate_port in self.wireless_candidates(host):
+                serial = self.connect_wireless_candidate(candidate_host, candidate_port)
+                if serial is not None:
+                    return serial
+            time.sleep(1.0)
+
+        # mDNS may be unavailable even though pairing succeeded; ask once for the
+        # "connect" endpoint shown next to the pairing dialog.
+        endpoint = ask("无线调试页的“连接用”IP:端口（留空放弃）: ").strip()
+        if endpoint:
+            candidate_host, _, port_text = endpoint.rpartition(":")
+            try:
+                candidate_port = int(port_text)
+            except ValueError as exc:
+                raise QuestSetupError(f"连接端口无效：{endpoint}") from exc
+            serial = self.connect_wireless_candidate(candidate_host or host, candidate_port)
+            if serial is not None:
+                return serial
+        raise QuestSetupError(
+            "配对成功但未能建立无线 ADB；确认头显无线调试仍开启、与电脑在同一个"
+            " Wi-Fi，然后重试或插 USB 线"
+        )
+
+    @staticmethod
+    def _ask_pairing_endpoint(ask: Callable[[str], str]) -> tuple[str, int]:
+        endpoint = ask(
+            "头显无线调试页的 IP:端口（首次配对填配对端口；已配对填连接端口）: "
+        ).strip()
+        host, _, port_text = endpoint.rpartition(":")
+        if not host:
+            host = endpoint
+            port_text = ask("端口: ").strip()
+        try:
+            port = int(port_text)
+        except ValueError as exc:
+            raise QuestSetupError(f"配对端口无效：{port_text}") from exc
+        return host, port
+
+    def _prepare_wireless_device(self, serial: str) -> QuestSetup:
+        ip = (
+            serial.rsplit(":", 1)[0]
+            if ":" in serial
+            else self.detect_quest_ip(serial)
+        )
+        self._ensure_app(serial)
+        self._launch_app(serial)
+        if ip:
+            self._save_ip(ip)
+        return QuestSetup(serial=serial, ip=ip, wireless=True, package=self.package)
+
     def shell(self, serial: str, *command: str, check: bool = True) -> str:
         result = self.run(
             ["-s", serial, "shell", *command],
@@ -231,8 +468,33 @@ class QuestAdb:
         saved_ip: str | None,
         allow_usb_only: bool,
         keep_usb_adb: bool = False,
+        prefer_wireless: bool = False,
     ) -> QuestSetup:
         devices = self.devices()
+        if prefer_wireless and requested_serial is None:
+            usb_present = any(
+                ":" not in serial and state == "device"
+                for serial, state in devices.items()
+            )
+            services = self.mdns_services()
+            wireless_visible = bool(
+                requested_ip
+                or self.ip_on_local_network(saved_ip)
+                or services["connect"]
+                or services["pairing"]
+            )
+            # With a USB cable attached and no wireless service advertising, do not
+            # block on a pairing prompt: the cable already works.
+            if wireless_visible or not usb_present:
+                try:
+                    serial = self.pair_and_connect(saved_ip or requested_ip)
+                except QuestSetupError as exc:
+                    warn(f"无线 ADB 未连上：{exc}")
+                else:
+                    log(f"[INFO] Quest 无线 ADB 已连接：{serial}")
+                    return self._prepare_wireless_device(serial)
+            else:
+                warn("未发现 Wireless debugging 服务，回退 USB ADB")
 
         if requested_serial:
             state = devices.get(requested_serial) or self.state(requested_serial)
@@ -260,15 +522,11 @@ class QuestAdb:
             )
 
         connected = [serial for serial, state in devices.items() if state == "device"]
-        wireless = [serial for serial in connected if ":" in serial]
+        wireless = [serial for serial in connected if is_wireless_serial(serial)]
         if wireless:
             serial = wireless[0]
-            ip = serial.rsplit(":", 1)[0]
             log(f"[INFO] 复用已有无线 ADB 连接：{serial}")
-            self._ensure_app(serial)
-            self._launch_app(serial)
-            self._save_ip(ip)
-            return QuestSetup(serial=serial, ip=ip, wireless=True, package=self.package)
+            return self._prepare_wireless_device(serial)
 
         usb = [serial for serial in connected if ":" not in serial]
         if usb:
@@ -313,8 +571,8 @@ class QuestAdb:
             )
 
         raise QuestSetupError(
-            "未检测到 Quest。第一次连接请使用支持数据传输的 USB 线，"
-            "开启 Quest 开发者模式与 USB 调试，并运行 adb devices -l 检查状态。"
+            "未检测到 Quest。插 USB 线并允许 USB 调试，或加 --quest-wireless 走无线："
+            "先在头显里开启 Wireless debugging（会显示配对码），再运行并输入配对码。"
         )
 
     def _choose_usb_device(self, serials: list[str]) -> str:
@@ -500,32 +758,40 @@ def find_adb(argument: str | None) -> str:
     return adb
 
 
-def prepare_quest(
-    args: argparse.Namespace,
-    *,
-    keep_usb_adb: bool = False,
-) -> QuestSetup:
-    adb_path = find_adb(args.adb)
-    adapter = QuestAdb(
-        adb_path,
+def saved_quest_ip() -> str | None:
+    """Return the last successfully used Quest Wi-Fi IP, if it was saved."""
+    if not DEFAULT_IP_FILE.is_file():
+        return None
+    try:
+        return DEFAULT_IP_FILE.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def make_adapter(args: argparse.Namespace) -> QuestAdb:
+    return QuestAdb(
+        find_adb(args.adb),
         Path(args.apk).expanduser().resolve(),
         args.package,
         args.adb_port,
     )
-    adapter.start_server()
 
-    saved_ip = None
-    if DEFAULT_IP_FILE.is_file():
-        try:
-            saved_ip = DEFAULT_IP_FILE.read_text(encoding="utf-8").strip() or None
-        except OSError:
-            saved_ip = None
+
+def prepare_quest(
+    args: argparse.Namespace,
+    *,
+    keep_usb_adb: bool = False,
+    prefer_wireless: bool = False,
+) -> QuestSetup:
+    adapter = make_adapter(args)
+    adapter.start_server()
     return adapter.choose_device(
         requested_serial=args.serial,
         requested_ip=args.quest_ip,
-        saved_ip=saved_ip,
+        saved_ip=saved_quest_ip(),
         allow_usb_only=args.allow_usb_only,
         keep_usb_adb=keep_usb_adb,
+        prefer_wireless=prefer_wireless,
     )
 
 
@@ -543,6 +809,23 @@ def pc_service_running() -> bool:
         if b"RoboticsServiceProcess" in command_line:
             return True
     return False
+
+
+def pc_service_command(service_script: Path) -> list[str]:
+    """Build the argv that launches the vendor PC Service script.
+
+    ``runService.sh`` ships without a shebang and uses ``BASH_SOURCE``, so
+    exec'ing it directly fails with ENOEXEC ("Exec format error"). Running it
+    through bash is what the vendor's own instructions do; a missing bash is a
+    configuration error, not a reason to fall back to the broken direct exec.
+    """
+    bash = shutil.which("bash")
+    if bash is None:
+        raise QuestSetupError(
+            "找不到 bash，无法启动厂商的 runService.sh（脚本没有 shebang，"
+            "不能直接执行）"
+        )
+    return [bash, str(service_script)]
 
 
 def maybe_start_pc_service(args: argparse.Namespace) -> None:
@@ -566,7 +849,7 @@ def maybe_start_pc_service(args: argparse.Namespace) -> None:
     log(f"[INFO] 启动 XRoboToolkit PC Service：{service_script}")
     try:
         subprocess.Popen(
-            [str(service_script)],
+            pc_service_command(service_script),
             cwd=str(service_script.parent),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -910,8 +1193,9 @@ def read_and_print(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "通过 USB 首次配置 Quest 3，切换无线 ADB，启动 XRoboToolKit APK，"
+            "通过 USB 或无线 ADB 配置 Quest 3，启动 XRoboToolKit APK，"
             "并打印 PC Service 收到的 head/controller/hand 数据。"
+            "无线模式用 --wireless（自动发现/配对）或 --pair（只配对）。"
         )
     )
     parser.add_argument("--apk", default=str(DEFAULT_APK), help="Quest APK 路径")
@@ -923,7 +1207,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--adb-port",
         type=int,
         default=5555,
-        help="无线 ADB 端口，默认 5555",
+        help="无线 ADB 端口，默认 5555（旧式 adb tcpip 用）",
+    )
+    parser.add_argument(
+        "--wireless",
+        action="store_true",
+        help="优先尝试无线 ADB（mDNS 自动发现/按提示输入配对码），失败回退 USB",
+    )
+    parser.add_argument(
+        "--pair",
+        action="store_true",
+        help="只做无线 ADB 配对/连接（按提示输入配对码），成功后退出",
     )
     parser.add_argument(
         "--skip-adb",
@@ -989,6 +1283,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--adb-port 必须在 1..65535 范围内")
     if args.prepare_only and args.skip_adb:
         parser.error("--prepare-only 与 --skip-adb 不能同时使用")
+    if args.pair and args.skip_adb:
+        parser.error("--pair 与 --skip-adb 不能同时使用")
 
 
 def handle_stop_signal(signum: int, _frame: Any) -> None:
@@ -1005,6 +1301,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, handle_stop_signal)
 
     try:
+        if args.pair:
+            adapter = make_adapter(args)
+            adapter.start_server()
+            serial = adapter.pair_and_connect(saved_quest_ip())
+            log(f"[INFO] 无线 ADB 已连接：{serial}")
+            return 0
+
         if not args.prepare_only and importlib.util.find_spec("xrobotoolkit_sdk") is None:
             raise QuestSetupError(
                 "未安装 xrobotoolkit_sdk。请运行："
@@ -1016,7 +1319,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         setup = None
         if not args.skip_adb:
-            setup = prepare_quest(args)
+            setup = prepare_quest(args, prefer_wireless=args.wireless)
             if setup.wireless:
                 log(f"[INFO] Quest 无线 ADB：{setup.serial}")
             else:

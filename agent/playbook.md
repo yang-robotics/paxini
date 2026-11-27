@@ -5,9 +5,12 @@
 ## 1. 跑一次采集（从零）
 
 ```bash
-# 0) 环境（只做一次，已装可跳）
-sudo dpkg -i ../sdk/pxhandsdk_1.0.0.0.ubantu2204_amd64.deb
-python3.10 -m pip install --user -r ../requirements.txt
+# 0) 环境（只做一次，已装可跳；必须 --system-site-packages 才看得见 DEB 里的 pxhandsdk）
+cd ../..
+/usr/bin/python3.10 -m venv --system-site-packages Paxini-Cap/.venv
+source Paxini-Cap/.venv/bin/activate
+pip install --ignore-installed -r Paxini-Cap/requirements.txt
+cd Paxini-Cap/Cap_Quest
 
 # 1) 确认设备在
 python3.10 capture/collect_cap.py --list-devices    # 串口末尾应是 PXCap，ffmpeg 应 ≥ 5.0
@@ -18,14 +21,33 @@ python3.10 selftest/selftest.py                     # 全过
 # 3) 关 NTP（必须）
 sudo timedatectl set-ntp false
 
-# 4) 采
-python3.10 capture/collect_cap.py --cap-side right --no-quest
+# 4) 采（手套 + 双相机 + Quest；PC Service 由程序用 bash 拉起）
+python3.10 capture/collect_cap.py --cap-side right --start-pc-service
+#    没头显时把 --start-pc-service 换成 --no-quest
 ```
 
+启动后**先等「准备完毕」再按任意键**：待机期 Quest/手套的样本不会落盘，相机已经在录
+（预录 1–2.5 s）。非 TTY/自动化加 `--no-wait`。`--duration` 从按键开始计时。
+
 **成功判据**：结束时会打印 `verify.row_mismatch` 为空。非空说明某组数据集首维与
-自己的行数不一致，这个文件能打开但按行取数会整体错位。
+自己的行数不一致，这个文件能打开但按行取数会整体错位。另看
+`manifest.session.started_at`（按键）与 `manifest.quest.first_sequence`（不是 1 是正常的，
+poller 在待机期已经计数）。
 
 产物在 `Paxini-Cap/Recordings/data_<YYYYMMDD>_<n>/`（在 `Cap_Quest` 下看是 `../Recordings/`）。
+
+### C8：Quest 时间戳要不要换算
+
+默认 `--quest-align unix` 直接把 SDK 戳当主机墙钟；实测 `data_20261127_4`/`_2` 快
+**+2.55 s**。要让对齐产物和查看器用换算后的时间，先单独跑探针，再在 Align 里给报告：
+
+```bash
+python3.10 diagnostics/quest_clock_probe.py --duration 60 --rate 30 --start-pc-service
+python3.10 ../Paxini-Align/align_capture.py <录制目录> \
+  --quest-align sdk_unix --quest-clock-report clock_probe/run_*/report.json
+```
+
+重复判据按“同一时间戳持续 >1 s”算，120 Hz 轮询的重复不再误杀。
 
 ## 2. 采集起不来，按现象查
 
@@ -37,7 +59,8 @@ python3.10 capture/collect_cap.py --cap-side right --no-quest
 | 相机 0 fps / 5 fps | 先 `--list-devices` 看节点，再查分辨率/帧率是否被设备支持；5 fps 多半是带宽或 Hub 问题 |
 | 相机 20 秒不出图 | 先 `--camera-mode cam0` 排除带宽；再验分辨率是否被支持。宽限期后仍无帧会直接中止整场（`runtime.abort_reason`） |
 | Quest 装配失败（PC Service / ADB / SDK） | 直接判启动失败，不再降级。没头显就显式加 `--no-quest` |
-| Quest 有行但全是 -1/NaN | PC Service 中途掉线，getter 异常被吞：查 `manifest.quest.errors` |
+| Quest 无线连不上 | 头显先开 Wireless debugging 并保持唤醒；`quest3.py --pair` 单独排查；配对码只在头显屏幕显示时有效 |
+| Quest 有行但全是 -1/NaN | PC Service 中途掉线，getter 异常被吞：查 `manifest.quest.errors`；若 `valid_rows=0`，先看头显是否锁屏/没戴、APK 是否前台、Tracking/Send 是否开 |
 | 采完没有 `manifest.json` | 被强杀了。数据落在最后一个满批之前（每批已 flush），先 `--clear-write-flag` 再读；2026-11-13 那批老文件没这个保护，全废 |
 
 ## 3. 改 HDF5 字段
@@ -131,6 +154,7 @@ python3.10 viewer/visualize.py ../Recordings/data_20261113_9 --save-png a.png
 
 ```bash
 cd Paxini-Cap/Cap_Quest
+source ../.venv/bin/activate                         # 三关都在 Paxini-Cap/.venv 里跑
 python3.10 -m py_compile capture/*.py viewer/*.py selftest/*.py latency/*.py calib/*.py
 python3.10 -m pyflakes  capture/*.py viewer/*.py selftest/*.py latency/*.py calib/*.py
 python3.10 selftest/selftest.py                      # 全过（项数以运行输出为准）

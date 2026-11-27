@@ -14,10 +14,14 @@
 
 ## 1. 前置条件
 
+在 `Paxini-Cap/` 下先激活环境（建法见 [`../README.md` §1.0](../README.md)）：
+
 ```bash
+cd Paxini-Cap
+source .venv/bin/activate
 python3.10 -c "import pxhandsdk; print(hasattr(pxhandsdk, 'PxCap3'))"   # 必须是 True
 ls -l /dev/ttyACM*                                                       # 手套串口
-export PATH="$HOME/bin:$PATH"                                            # ffmpeg/ffprobe
+command -v ffmpeg                                                       # 5.0 以上
 ```
 
 系统默认 `python3` 是 3.12 时 `PxCap3` 加载不出来，一律用 `python3.10`。
@@ -54,7 +58,7 @@ python3.10 camera.py 3           # 每路录 3 秒
 
 | 现象 | 处理 |
 |---|---|
-| `No module named 'pxhandsdk'` | 用了 3.12 或 venv；换 `python3.10` |
+| `No module named 'pxhandsdk'` / `PxCap3` 缺失 | 用了 3.12，或 venv 没带 `--system-site-packages`；按 [`../README.md` §1.0](../README.md) 建 venv（漏了可软链 `pxhandsdk`） |
 | 连接失败 `code=101` | 不在 `dialout` 组；跑 `setup-serial-access.sh` 后重新登录 |
 | 连接失败 `code=102` | 串口被占用；关掉 PXCap Studio 或旧进程 |
 | 连续采集接口返回 `4000` | 采集进行中，除 stop/disconnect/is_connected 外都不能调 |

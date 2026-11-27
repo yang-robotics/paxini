@@ -16,7 +16,8 @@
 | 单只手套左右手选择 | `capture/collect_cap.py` | `HAND_SIDES`、`build_parser()`、`resolve_pose_side()`(:1622)、`main()` | `selftest` 的 "手别选择" 组 |
 | 启动失败诊断 | `capture/collect_cap.py` | `write_startup_failure()`(:1660)、`main()` 的 `finally` | `selftest` 的 "启动失败工件" 组 |
 | 采集主循环节拍 | `capture/collect_cap.py` | `pump_and_record()`(:2073) | 跑一次采集看 `manifest.row_mismatch` |
-| **三源起停与运行期检查** | `capture/collect_cap.py` | `RuntimeMonitor`(:1863)、`abort_recording()`(:186)、`main()` 启动段 | `selftest` 的「三源运行期检查」8 项；真机看 manifest `runtime.abort_reason` |
+| **启动闸门（待机 + 按键）** | `capture/collect_cap.py` | `StartGate`、`SelectedPoseWatch`、`read_start_key()`、`wait_for_camera_first_frames()`、`main()` 启动段 | `selftest` 的「启动闸门与位姿冻结」；真机看 `manifest.session` / `quest.standby_samples_discarded` |
+| **三源起停与运行期检查** | `capture/collect_cap.py` | `RuntimeMonitor`、`abort_recording()`、`main()` 启动段 | `selftest` 的「三源运行期检查」+「启动闸门与位姿冻结」；真机看 manifest `runtime.abort_reason` |
 | 相机出帧检查（0.5 Hz） | `capture/collect_cap.py` + `camera_ffmpeg.py` | `RuntimeMonitor._check_frames()`、`progress_signal()`(:487) | `selftest` 首帧宽限 / 停滞 / 未配置三组 |
 | 回调线程入队 | `capture/collect_cap.py` | `snapshot_cap_frame()`(:316) | 只做拷贝，别在这里写盘 |
 | 批量落盘策略 | `capture/collect_cap.py` | `Hdf5Recorder.write_cap()`(:702)、`flush_cap()`(:724) / `_flush_cap_locked()`、`FLUSH_ROWS`(:160) | flush 时机影响中途读文件的结果 |
@@ -34,8 +35,12 @@
 | 相机出帧进度 | `capture/camera_ffmpeg.py` | `progress_signal()`(:487) | 兼容 `frame` / `out_time_us` / `total_size` |
 | 每帧时间戳回填 | `capture/camera_ffmpeg.py` | `probe()`(:607) → `probe_frames()`(:178) | 采集后看 `cameras/*/timestamp_unix_ns` 是否单调 |
 | 设备枚举 | `capture/camera_ffmpeg.py` | `discover_video_nodes()`(:74) | `--list-devices` |
+| ffmpeg 路径解析 | `capture/collect_cap.py` + `camera_ffmpeg.py` | `resolve_ffmpeg()`、`find_ffmpeg()` | `--list-devices --ffmpeg <路径>` 看打印的版本 |
+| PC Service 启动 | `capture/quest3.py` | `pc_service_command()`、`maybe_start_pc_service()` | `selftest` 杂项；真机看 `RoboticsServiceProcess` 是否在跑 |
 | Quest 连接与样本 | `capture/quest3.py` | `XrtReader.collect_sample()` | `selftest` 的 "Quest 采集" 组 |
-| Quest C8 时钟探针 | `diagnostics/quest_clock_probe.py` | `run_probe()`(:286)、`evaluate_clock_samples()`(:130) | `selftest` 的 "C8 探针" 组；产物落 `clock_probe/` |
+| Quest 数据有效性 | `capture/collect_cap.py` | `quest_sample_is_valid()`、`SelectedPoseWatch`、`RuntimeMonitor._check_health()` | `selftest` 的三源运行期检查 + 启动闸门；看 `manifest.quest.valid_rows` / `manifest.quest.selected_pose` |
+| Quest 无线 ADB | `capture/quest3.py` | `parse_mdns_services()`、`pair_and_connect()`、`--pair/--wireless` | `selftest` 的 "无线 ADB" 组；真机 `quest3.py --pair` |
+| Quest C8 时钟探针 | `diagnostics/quest_clock_probe.py` | `run_probe()`、`evaluate_clock_samples()` | `selftest` 的 "C8 探针" 组；重复判据按持续时长（默认 1 s），产物落 `clock_probe/` |
 | 回放窗口 | `viewer/visualize.py` | `collect_payload()`(:380) → `run_window()`(:549) / `write_viewer()`(:966) | `--save-png` 出一张 |
 | Quest 回放 payload | `viewer/quest_view.py` | `load_quest_view()`(:161)、`load_clock_report()`(:115)、`take_evenly()`(:26) | `selftest` 的 "Quest 可视化"；默认按 Unix 轴对齐，`none` 才独立轴 |
 | 回放视频预览 | `viewer/visualize.py` | `build_preview()`(:302) | `selftest` 的 "视频" 组 |

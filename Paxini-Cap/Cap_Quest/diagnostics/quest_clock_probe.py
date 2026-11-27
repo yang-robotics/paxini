@@ -44,7 +44,13 @@ THRESHOLDS = {
     "min_valid_fraction": 0.95,
     "min_duration_fraction": 0.95,
     "max_backwards_steps": 0,
+    # A pull loop polls faster than the SDK updates, so the same timestamp is
+    # expected to repeat for a few rows. What matters is wall time: a frozen
+    # clock holds one value for seconds, not for one poll interval. The count
+    # is kept in the report for older readers/humans; the gate is the duration
+    # key below.
     "max_same_timestamp_run": 10,
+    "max_same_timestamp_run_s": 1.0,
     "max_residual_median_ms": 10.0,
     "max_residual_p99_ms": 30.0,
     "max_slope_error_ppm": 100.0,
@@ -167,16 +173,25 @@ def evaluate_clock_samples(
     )
 
     max_run = 0
+    max_run_s = 0.0
     run = 0
+    run_start_host_ns: int | None = None
     previous = -1
-    for value in sdk_values:
+    for row, value in zip(rows, sdk_values):
         value = int(value)
+        host_ns = int(row["host_unix_mid_ns"])
         if value > 0 and value == previous:
             run += 1
+            if run_start_host_ns is not None:
+                max_run_s = max(
+                    max_run_s, (host_ns - run_start_host_ns) / 1e9
+                )
         elif value > 0:
             run = 1
+            run_start_host_ns = host_ns
         else:
             run = 0
+            run_start_host_ns = None
         max_run = max(max_run, run)
         previous = value
 
@@ -214,10 +229,13 @@ def evaluate_clock_samples(
         )
     if backwards > int(limits["max_backwards_steps"]):
         failures.append(f"时间戳倒退 {backwards} 次")
-    if max_run > int(limits["max_same_timestamp_run"]):
+    max_run_limit_s = float(
+        limits.get("max_same_timestamp_run_s", 1.0)
+    )
+    if max_run_s > max_run_limit_s:
         failures.append(
-            f"同一时间戳连续重复 {max_run} 次，超过 "
-            f"{int(limits['max_same_timestamp_run'])}"
+            f"同一时间戳连续重复 {max_run} 次 / {max_run_s:.3f} 秒，"
+            f"超过 {max_run_limit_s:g} 秒（时钟疑似冻结）"
         )
     if unix_model is None:
         failures.append("有效时间戳更新不足，无法拟合 Unix 时钟模型")
@@ -265,6 +283,7 @@ def evaluate_clock_samples(
             "unique_sdk_timestamps": unique_sdk,
             "timestamp_backwards_steps": backwards,
             "max_same_timestamp_run": max_run,
+            "max_same_timestamp_run_s": float(max_run_s),
         },
         "models": {
             "host_unix": unix_model,

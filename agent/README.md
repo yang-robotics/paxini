@@ -34,8 +34,9 @@ Paxini-Dex/   会运动
               输出 aligned.jsonl + hand_pose.csv + 逐帧 JPG（采集时就对齐）
 ```
 
-两条线的代码骨架同源：`Cap_Quest` 对应 `Dex_Quest`。但 `quest3.py` 已经分叉，
-差异在 `collect_sample` 和模块 docstring，**不要为了"一致"去同步它们**。
+两条线的代码骨架同源：`Cap_Quest` 对应 `Dex_Quest`。但 `quest3.py` 已经分叉：
+Cap 侧多了无线 ADB 配对/发现和 `pc_service_command()`，Dex 侧没有，
+**不要为了"一致"去同步它们**。
 
 ## 现在什么能用
 

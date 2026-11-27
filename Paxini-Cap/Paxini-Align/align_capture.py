@@ -146,8 +146,18 @@ def sdk_unix_to_host_unix_ns(
     return host
 
 
-def quest_timestamp_quality(raw_ns: np.ndarray) -> dict[str, Any]:
-    """Measure the file-level C8 gates without changing the source stamps."""
+def quest_timestamp_quality(
+    raw_ns: np.ndarray,
+    poll_rate_hz: float = 120.0,
+) -> dict[str, Any]:
+    """Measure the file-level C8 gates without changing the source stamps.
+
+    A pull loop polls faster than the SDK updates, so one SDK timestamp can
+    repeat for several rows (26 at 120 Hz was measured). The C8 gate is a
+    *duration*: ``max_same_timestamp_run / poll_rate_hz``. The poll rate comes
+    from ``quest.poll_rate_hz`` in the manifest when available; 120 Hz is the
+    writer's default for older files.
+    """
     raw = np.asarray(raw_ns, dtype=np.int64)
     valid = raw[raw > 0]
     valid_count = int(valid.size)
@@ -164,6 +174,9 @@ def quest_timestamp_quality(raw_ns: np.ndarray) -> dict[str, Any]:
             run = 0
         max_run = max(max_run, run)
         previous = value
+    rate = float(poll_rate_hz)
+    if not np.isfinite(rate) or rate <= 0.0:
+        rate = 120.0
     return {
         "rows": int(raw.size),
         "valid_count": valid_count,
@@ -175,7 +188,24 @@ def quest_timestamp_quality(raw_ns: np.ndarray) -> dict[str, Any]:
             else 0
         ),
         "max_same_timestamp_run": max_run,
+        "max_same_timestamp_run_s": max_run / rate,
+        "poll_rate_hz": rate,
     }
+
+
+def _quest_poll_rate_hz(handle: Any) -> float:
+    """Read ``quest.poll_rate_hz`` from the HDF5 ``meta`` attrs, default 120."""
+    try:
+        quest_meta = handle["meta"].attrs.get("quest")
+        if isinstance(quest_meta, (str, bytes)):
+            quest_meta = json.loads(quest_meta)
+        if isinstance(quest_meta, dict):
+            value = float(quest_meta.get("poll_rate_hz") or 0.0)
+            if np.isfinite(value) and value > 0.0:
+                return value
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return 120.0
 
 
 WRITE_FLAG_HINT = (
@@ -491,14 +521,13 @@ def align_quest_to_targets(
     if "quest" not in handle or "quest/sdk_timestamp_ns" not in handle:
         raise AlignError("请求 Quest 对齐，但 data.h5 里没有 quest/sdk_timestamp_ns")
     raw = np.asarray(handle["quest/sdk_timestamp_ns"][:], dtype=np.int64)
-    quality = quest_timestamp_quality(raw)
+    quality = quest_timestamp_quality(raw, _quest_poll_rate_hz(handle))
 
     limits = (clock_report or {}).get("thresholds") or {}
     min_valid_fraction = float(
         limits.get("min_valid_fraction", DEFAULT_QUEST_MIN_VALID_FRACTION)
     )
     max_backwards = int(limits.get("max_backwards_steps", 0))
-    max_run = int(limits.get("max_same_timestamp_run", 10))
 
     failures: list[str] = []
     warnings: list[str] = []
@@ -506,11 +535,12 @@ def align_quest_to_targets(
         failures.append("没有任何有效 SDK 时间戳")
     if quality["backwards_steps"] > max_backwards:
         failures.append(f"时间戳倒退 {quality['backwards_steps']} 次，时间轴非单调")
+    max_run_s = float(limits.get("max_same_timestamp_run_s", 1.0))
     repeated = (
-        f"同一时间戳连续重复 {quality['max_same_timestamp_run']} 次，"
-        f"超过 {max_run}"
+        f"同一时间戳连续重复 {quality['max_same_timestamp_run']} 次 / "
+        f"{quality['max_same_timestamp_run_s']:.3f} 秒，超过 {max_run_s:g} 秒"
     )
-    if quality["max_same_timestamp_run"] > max_run:
+    if quality["max_same_timestamp_run_s"] > max_run_s:
         # 拉取模型下重复是常态。sdk_unix 有 C8 报告背书，超限即判失败；
         # unix 模式只提示——重复不破坏「同一条时间轴」这个前提。
         (failures if mode == QUEST_ALIGNMENT_SDK_UNIX else warnings).append(repeated)

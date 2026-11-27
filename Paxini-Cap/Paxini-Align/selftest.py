@@ -194,6 +194,7 @@ def make_clock_report(
             "min_duration_fraction": 0.95,
             "max_backwards_steps": 0,
             "max_same_timestamp_run": 10,
+            "max_same_timestamp_run_s": 1.0,
             "max_residual_median_ms": 10.0,
             "max_residual_p99_ms": 30.0,
             "max_slope_error_ppm": 100.0,

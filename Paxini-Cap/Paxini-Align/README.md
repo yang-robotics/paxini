@@ -111,20 +111,29 @@ python3 align_capture.py <采集目录> --quest-align none   # 不想带 Quest
 日志打一行「已请求对齐但没有数据，本次跳过」，仍然 `exit 0`。所以默认值改成对齐之后，
 批量跑老采集不会因为缺 Quest 而失败。
 
-若以后要让时钟域有证据，跑 C8 探针并把报告传给更严格的 `sdk_unix`：
+**实测提醒（2026-11-27）**：`data_20261127_4` / `_2` 的 `sdk_timestamp_ns` 比主机 Unix
+快 **+2.55 / +2.56 s**（30 s 内恒定）。默认 `unix` 会把这个偏移原样带进对齐结果；要用
+`align_capture.py` 的命令行 `--quest-align sdk_unix` 才换算掉。
 
 ```bash
-python3.10 ../Cap_Quest/diagnostics/quest_clock_probe.py --duration 60 --start-pc-service
+# 1) 单独跑探针（不需要 data.h5；头显保持在线、APK 保持发送）
+python3.10 ../Cap_Quest/diagnostics/quest_clock_probe.py \
+  --duration 60 --rate 30 --start-pc-service
 
+# 2) 对齐时把报告喂进来
 python3.10 align_capture.py <采集目录> \
   --quest-align sdk_unix \
   --quest-clock-report ../Cap_Quest/clock_probe/run_YYYYMMDD_HHMMSS/report.json
 ```
 
 `sdk_unix` 是硬门控：报告必须 `passed=true` 且 `clock_domain=unix_epoch`；当前文件的
-有效时间戳比例、倒退次数、同一时间戳最长重复必须达到报告阈值；采集期间手套墙钟若发生
-跳变直接失败；条件不满足时不写输出文件。报告是同一台主机、同一时钟状态下的**会话级
-证据**，输出记录它的 SHA-256 与换算模型。
+有效时间戳比例、倒退次数、**同一时间戳最长持续时长（默认 ≤1 s）**必须达到报告阈值；
+采集期间手套墙钟若发生跳变直接失败；条件不满足时不写输出文件。报告是同一台主机、
+同一时钟状态下的**会话级证据**，输出记录它的 SHA-256 与换算模型。
+
+重复判据按**持续时长**算，不按连续行数：120 Hz 轮询比 SDK 更新快，同一时间戳重复
+20 多行（≈0.2 s）是正常的；只有同一个值持续超过 1 s 才判时钟冻结。探针和本目录的
+`sdk_unix` 检查用同一条规则，所以探针用 30 Hz 或 120 Hz 跑都可以。
 
 ### Quest 的行选择：整行取前驱
 
@@ -152,10 +161,11 @@ python3.10 align_capture.py <采集目录> \
 `--quest-min-valid-fraction` 默认 `0.95`，**只对 `sdk_unix` 生效**：它比的是源文件里
 「时间戳非 -1 的行占比」，达标才允许做 C8 对齐。`unix` 模式完全不看这个数。
 
-当前 `data_20261118_1` / `_2` 的有效 SDK 时间戳只有 90.44% / 86.38%，最长连续重复
-5472 / 3128 次——`unix` 模式下仍会产出，但 `quest/valid` 会缺一片，用前先看
-`summary.quest.paired_fraction`（多少相机行真的配到了样本）。另外 C8 只确认时钟域，**没有测“设备采样 → SDK 打戳”
-的链路延迟**，所以不能把 SDK 时间称作曝光真值。
+当前 `data_20261118_1` / `_2` 的有效 SDK 时间戳只有 90.44% / 86.38%——`unix` 模式下
+仍会产出，但 `quest/valid` 会缺一片，用前先看 `summary.quest.paired_fraction`（多少
+相机行真的配到了样本）。那两个文件的 5472 / 3128 行连续重复是旧门控的产物；新门控按
+持续时长判，不会仅因为行数多就拒绝。另外 C8 只确认时钟域，**没有测“设备采样 → SDK
+打戳”的链路延迟**，所以不能把 SDK 时间称作曝光真值。
 
 ### 实际跑出来的数
 

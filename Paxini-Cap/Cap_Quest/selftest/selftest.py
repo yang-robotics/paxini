@@ -24,6 +24,7 @@ import base64
 
 import json
 import math
+import queue
 import shutil
 import sys
 import tempfile
@@ -50,21 +51,26 @@ from collect_cap import (
     CAP_MAX_POINTS,
     CAP_SLOT_POINTS,
     CAP_SLOTS,
+    READY_POSE_FRESH_S,
     STOP_EVENT,
     Hdf5Recorder,
     RuntimeMonitor,
+    SelectedPoseWatch,
+    StartGate,
     TimedSample,
     TimedStream,
     apply_config,
     build_parser,
     load_config_file,
     pump_and_record,
+    quest_sample_is_valid,
     quest_sample_to_row,
+    resolve_ffmpeg,
     resolve_pose_side,
     snapshot_cap_frame,
     write_startup_failure,
 )
-from quest3 import XrtReader
+from quest3 import QuestAdb, XrtReader, parse_mdns_services, pc_service_command
 from quest_clock_probe import evaluate_clock_samples
 from quest_view import (
     QUEST_ALIGNED_NOTE,
@@ -963,13 +969,20 @@ def test_config_file(tmp_root: Path) -> None:
         "# 整行注释\n"
         "camera_mode: cam0   # 行尾也算注释\n"
         "hand_rate: 90\n"
-        "view: true\n",
+        "view: true\n"
+        "ffmpeg: /opt/ffmpeg-7.0.2/ffmpeg\n",
         encoding="utf-8",
     )
     yaml_config = load_config_file(yaml_path)
     check(
         "配置/读 YAML 且注释被忽略",
-        yaml_config == {"camera_mode": "cam0", "hand_rate": 90, "view": True},
+        yaml_config
+        == {
+            "camera_mode": "cam0",
+            "hand_rate": 90,
+            "view": True,
+            "ffmpeg": "/opt/ffmpeg-7.0.2/ffmpeg",
+        },
         str(yaml_config),
     )
 
@@ -1006,6 +1019,38 @@ def test_config_file(tmp_root: Path) -> None:
     check(
         "配置/实时视图命令行可关掉",
         view_parser.parse_args(["--no-view"]).view is False,
+    )
+
+    ffmpeg_parser = build_parser()
+    apply_config(ffmpeg_parser, yaml_config, yaml_path)
+    ffmpeg_args = ffmpeg_parser.parse_args([])
+    check(
+        "配置/ffmpeg 路径可写在文件里",
+        ffmpeg_args.ffmpeg == "/opt/ffmpeg-7.0.2/ffmpeg",
+        ffmpeg_args.ffmpeg,
+    )
+    check(
+        "配置/ffmpeg 命令行覆盖文件",
+        ffmpeg_parser.parse_args(["--ffmpeg", "/usr/local/bin/ffmpeg"]).ffmpeg
+        == "/usr/local/bin/ffmpeg",
+    )
+
+    gate_parser = build_parser()
+    apply_config(
+        gate_parser,
+        {"no_wait": True, "quest_ready_samples": 5},
+        path,
+    )
+    gate_args = gate_parser.parse_args([])
+    check(
+        "配置/启动闸门参数可写文件",
+        gate_args.no_wait is True and gate_args.quest_ready_samples == 5,
+        f"no_wait={gate_args.no_wait!r} "
+        f"ready={gate_args.quest_ready_samples!r}",
+    )
+    check(
+        "配置/--no-wait 命令行可打开",
+        build_parser().parse_args(["--no-wait"]).no_wait is True,
     )
 
     for bad_config, label in (
@@ -1322,9 +1367,146 @@ def test_camera_preview(tmp_root: Path) -> None:
     )
 
 
+def test_wireless_adb() -> None:
+    """mDNS discovery and pair-then-connect flow, without touching a device."""
+    text = (
+        "List of discovered mdns services\n"
+        "adb-1\t_adb-tls-connect._tcp\t192.168.1.5:41234\n"
+        "adb-2\t_adb-tls-pairing._tcp\t192.168.1.5:37123\n"
+        "garbage line\n"
+    )
+    parsed = parse_mdns_services(text)
+    check(
+        "无线/解析 connect 服务",
+        parsed["connect"] == [("192.168.1.5", 41234)],
+        str(parsed),
+    )
+    check(
+        "无线/解析 pairing 服务",
+        parsed["pairing"] == [("192.168.1.5", 37123)],
+        str(parsed),
+    )
+    check(
+        "无线/忽略非 adb-tls 行",
+        parse_mdns_services("List of discovered mdns services")
+        == {"connect": [], "pairing": []},
+    )
+
+    parser = build_parser()
+    check(
+        "无线/collect_cap 有 --quest-wireless",
+        parser.parse_args(["--quest-wireless"]).quest_wireless is True,
+    )
+    check(
+        "无线/--quest-wireless 默认关闭",
+        parser.parse_args([]).quest_wireless is False,
+    )
+
+    class FakeWireless(QuestAdb):
+        def __init__(self) -> None:
+            super().__init__("adb", Path("/nonexistent.apk"), "pkg", 5555)
+            self.commands: list[tuple[str, ...]] = []
+            self.paired = False
+
+        def mdns_services(self) -> dict[str, list[tuple[str, int]]]:
+            if self.paired:
+                return {"connect": [("10.0.0.2", 41000)], "pairing": []}
+            return {"connect": [], "pairing": [("10.0.0.2", 37000)]}
+
+        def connect_wireless_candidate(
+            self, host: str, port: int, wait_seconds: float = 4.0
+        ) -> str | None:
+            if self.paired and port == 41000:
+                return f"{host}:{port}"
+            return None
+
+        def run(self, args: Any, **kwargs: Any) -> Any:
+            self.commands.append(tuple(args))
+            if args[0] == "pair":
+                self.paired = True
+                return types.SimpleNamespace(
+                    returncode=0, stdout="Successfully paired", stderr=""
+                )
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def _save_ip(self, ip: str) -> None:
+            self.saved_ip = ip
+
+    adapter = FakeWireless()
+    serial = adapter.pair_and_connect(ask=lambda prompt: "123456")
+    check("无线/配对后拿到连接串", serial == "10.0.0.2:41000", str(serial))
+    check(
+        "无线/adb pair 命令正确",
+        ("pair", "10.0.0.2:37000", "123456") in adapter.commands,
+        str(adapter.commands),
+    )
+
+    class FakeChoose(QuestAdb):
+        def __init__(self) -> None:
+            super().__init__("adb", Path("/nonexistent.apk"), "pkg", 5555)
+            self.prepared: str | None = None
+
+        def devices(self) -> dict[str, str]:
+            return {"USB123": "device"}
+
+        def mdns_services(self) -> dict[str, list[tuple[str, int]]]:
+            return {"connect": [], "pairing": []}
+
+        def pair_and_connect(self, *args: Any, **kwargs: Any) -> str:
+            raise AssertionError("USB 已可用时不应提示配对")
+
+        def _prepare_selected_device(
+            self,
+            serial: str,
+            requested_ip: str | None,
+            allow_usb_only: bool,
+            keep_usb_adb: bool = False,
+        ) -> Any:
+            self.prepared = serial
+            return "USB_FALLBACK"
+
+    chooser = FakeChoose()
+    result = chooser.choose_device(
+        requested_serial=None,
+        requested_ip=None,
+        saved_ip=None,
+        allow_usb_only=False,
+        keep_usb_adb=True,
+        prefer_wireless=True,
+    )
+    check(
+        "无线/有 USB 且无无线服务时不提示、回退 USB",
+        result == "USB_FALLBACK" and chooser.prepared == "USB123",
+        f"{result!r} {chooser.prepared!r}",
+    )
+
+
 def test_misc() -> None:
     check("杂项/ffprobe 帧率解析", parse_rate("30/1") == 30.0 and parse_rate("x") == 0.0)
     parser = build_parser()
+    check(
+        "杂项/--ffmpeg 参数存在且默认 auto",
+        parser.parse_args([]).ffmpeg == "auto",
+    )
+    check(
+        "杂项/--ffmpeg 可覆盖路径",
+        parser.parse_args(["--ffmpeg", "/x/ffmpeg"]).ffmpeg == "/x/ffmpeg",
+    )
+    check(
+        "杂项/ffmpeg auto 表示查环境变量与 PATH",
+        resolve_ffmpeg("auto") is None
+        and resolve_ffmpeg(None) is None
+        and resolve_ffmpeg("/x/ffmpeg") == "/x/ffmpeg",
+    )
+    service_script = Path("/opt/apps/roboticsservice/runService.sh")
+    service_argv = pc_service_command(service_script)
+    check(
+        "杂项/PC Service 经 bash 启动",
+        len(service_argv) == 2
+        and Path(service_argv[0]).name == "bash"
+        and service_argv[1] == str(service_script),
+        str(service_argv),
+    )
     check(
         "杂项/阈值参数已移除",
         not any("--max-skew-ms" in action.option_strings for action in parser._actions)
@@ -1768,7 +1950,7 @@ def test_clock_probe_report() -> None:
 
     frozen = [dict(row) for row in rows]
     frozen_sdk = int(frozen[10]["sdk_timestamp_ns"])
-    for index in range(10, 40):
+    for index in range(10, 160):
         frozen[index]["sdk_timestamp_ns"] = frozen_sdk
     failed = evaluate_clock_samples(frozen, target_duration_s=2.0)
     check(
@@ -1777,6 +1959,20 @@ def test_clock_probe_report() -> None:
         and any("连续重复" in reason for reason in failed["failures"]),
         str(failed["failures"]),
     )
+
+    # A 120 Hz pull loop outruns the SDK update, so a repeated timestamp for a
+    # few rows is normal; only a duration over one second is a frozen clock.
+    duplicated = []
+    for row in rows:
+        duplicated.append(dict(row))
+        duplicated.append(dict(row))
+    dupes = evaluate_clock_samples(duplicated, target_duration_s=2.0)
+    check(
+        "C8 探针/120 Hz 轮询重复不判失败",
+        dupes["passed"] is True
+        and dupes["metrics"]["max_same_timestamp_run"] == 2,
+        str(dupes["failures"]),
+    )
     short = evaluate_clock_samples(rows[:50], target_duration_s=2.0)
     check(
         "C8 探针/提前中断不能通过",
@@ -1784,6 +1980,299 @@ def test_clock_probe_report() -> None:
         and any("有效时长" in reason for reason in short["failures"]),
         str(short["failures"]),
     )
+
+
+def _pose_sample(sequence: int, x: float, tracked: bool = True) -> dict[str, Any]:
+    """Minimal Quest sample shape for SelectedPoseWatch / T3 tests."""
+    right_pose = {
+        "available": True,
+        "tracked": tracked,
+        "pose_xyzw": [x, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    }
+    left_pose = {
+        "available": True,
+        "tracked": False,
+        "pose_xyzw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    }
+    empty_hand = {"active": False, "joint_count": 0, "joints_pose_xyzw": None}
+    return {
+        "sequence": sequence,
+        "tracked": tracked,
+        "sdk_timestamp_ns": 1_000_000_000 + sequence,
+        "body_timestamp_ns": 0,
+        "motion_timestamp_ns": 0,
+        "body_joints_timestamp_ns": [],
+        "head": {
+            "available": True,
+            "tracked": True,
+            "pose_xyzw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        "controllers": {
+            "left": {"pose": left_pose, "grip": 0.0, "trigger": 0.0, "axis": [0.0, 0.0]},
+            "right": {"pose": right_pose, "grip": 0.0, "trigger": 0.0, "axis": [0.0, 0.0]},
+        },
+        "hands": {"left": dict(empty_hand), "right": dict(empty_hand)},
+        "buttons": {},
+    }
+
+
+def test_quest_sequence_floor(tmp_root: Path) -> None:
+    """Quest rows collected before the key are dropped by the sequence floor."""
+    class _Hand:
+        def __init__(self) -> None:
+            self.frames: queue.Queue[dict[str, Any]] = queue.Queue()
+
+    output_dir = tmp_root / "quest_floor"
+    recorder = Hdf5Recorder(
+        output_dir, "controller", "right", "right", (), True
+    )
+    recorder.__enter__()
+    stream = TimedStream(max_samples=10)
+    for sequence in (5, 6, 7, 8, 9):
+        stream.push(TimedSample(data=make_quest_sample(sequence)))
+    STOP_EVENT.set()
+    try:
+        pump_and_record(
+            recorder,
+            _Hand(),
+            stream,
+            0,
+            final=False,
+            quest_min_sequence=7,
+        )
+    finally:
+        STOP_EVENT.clear()
+    recorder.flush_quest()
+    with h5py.File(output_dir / "data.h5", "r") as handle:
+        sequences = handle["quest/sequence"][:].tolist()
+    check(
+        "启动闸门/sequence floor 丢掉按键前的 Quest 行",
+        sequences == [7, 8, 9],
+        str(sequences),
+    )
+    recorder.__exit__(None, None, None)
+
+
+def test_start_gate() -> None:
+    """Selected-pose readiness/freeze + T3 abort; no hardware."""
+    import collect_cap
+
+    now = [0.0]
+    watch = SelectedPoseWatch(
+        "controller", "right", clock=lambda: now[0]
+    )
+    for index in range(10):
+        watch.update(_pose_sample(index + 1, index * 0.001), now=now[0])
+        now[0] += 0.008
+    check(
+        "启动闸门/连续有效且位姿在变化 → 就绪",
+        watch.ready(
+            now=now[0],
+            required_samples=10,
+            fresh_s=READY_POSE_FRESH_S,
+        ),
+        f"consecutive={watch.consecutive_valid} age={watch.age_s(now[0]):.3f}",
+    )
+
+    frozen = _pose_sample(11, 0.009)
+    for _ in range(80):
+        watch.update(frozen, now=now[0])
+        now[0] += 0.008
+    check(
+        "启动闸门/位姿冻结 0.6 s → 不就绪",
+        not watch.ready(
+            now=now[0],
+            required_samples=10,
+            fresh_s=READY_POSE_FRESH_S,
+        ),
+        f"age={watch.age_s(now[0]):.3f}",
+    )
+
+    # Frozen from the very first sample: ten valid rows are not enough without
+    # an observed change.
+    frozen_now = [0.0]
+    frozen_watch = SelectedPoseWatch(
+        "controller", "right", clock=lambda: frozen_now[0]
+    )
+    for index in range(10):
+        frozen_watch.update(
+            _pose_sample(index + 1, 0.123), now=frozen_now[0]
+        )
+        frozen_now[0] += 0.008
+    check(
+        "启动闸门/从未变化过的位姿不就绪",
+        not frozen_watch.ready(
+            now=frozen_now[0],
+            required_samples=10,
+            fresh_s=READY_POSE_FRESH_S,
+        ),
+        f"changes={frozen_watch.changes} last_change={frozen_watch.last_change}",
+    )
+
+    watch.mark_stale()
+    check(
+        "启动闸门/mark_stale 后旧位姿不算新鲜",
+        not watch.ready(
+            now=now[0],
+            required_samples=10,
+            fresh_s=READY_POSE_FRESH_S,
+        ),
+    )
+    watch.update(_pose_sample(12, 0.5), now=now[0])
+    check(
+        "启动闸门/mark_stale 后有变化才算新鲜",
+        watch.ready(
+            now=now[0],
+            required_samples=10,
+            fresh_s=READY_POSE_FRESH_S,
+        ),
+    )
+
+    watch.update(_pose_sample(13, 0.5, tracked=False), now=now[0])
+    check(
+        "启动闸门/无效选定位姿清零连续计数",
+        watch.consecutive_valid == 0
+        and not watch.ready(
+            now=now[0],
+            required_samples=10,
+            fresh_s=READY_POSE_FRESH_S,
+        ),
+    )
+
+    # T3: samples keep arriving while the selected pose has not changed for 6 s.
+    collect_cap.ABORT_REASON = None
+    STOP_EVENT.clear()
+    monitor = RuntimeMonitor(
+        [],
+        _FakePoller(samples=100, valid_samples=100),
+        pose_source="controller",
+        pose_side="right",
+    )
+    for index in range(3):
+        monitor.note_quest(_pose_sample(index + 1, index * 0.001))
+    check(
+        "T3/选定位姿正常更新不中止",
+        collect_cap.ABORT_REASON is None,
+    )
+    assert monitor.pose_watch is not None
+    monitor.pose_watch.last_change = time.monotonic() - 6.0
+    monitor._next_process = 0.0
+    monitor.poll()
+    check(
+        "T3/选定位姿冻结 5 s 中止整场",
+        "选定位姿" in (collect_cap.ABORT_REASON or ""),
+        collect_cap.ABORT_REASON or "",
+    )
+    check(
+        "T3/冻结告警与最大冻结时长记账",
+        monitor.pose_stale_warnings >= 1 and monitor.pose_stale_max_s >= 5.0,
+        f"warnings={monitor.pose_stale_warnings} max={monitor.pose_stale_max_s}",
+    )
+    # A stale run warns once, not once per 1 Hz tick.
+    collect_cap.ABORT_REASON = None
+    STOP_EVENT.clear()
+    warn_monitor = RuntimeMonitor(
+        [],
+        _FakePoller(samples=100, valid_samples=100),
+        pose_source="controller",
+        pose_side="right",
+    )
+    warn_monitor.note_quest(_pose_sample(1, 0.0))
+    warn_monitor.note_quest(_pose_sample(2, 0.1))
+    assert warn_monitor.pose_watch is not None
+    warn_monitor.pose_watch.last_change = time.monotonic() - 2.0
+    warn_monitor._next_process = 0.0
+    warn_monitor.poll()
+    warn_monitor._next_process = 0.0
+    warn_monitor.poll()
+    check(
+        "T3/同一次冻结只告警一次",
+        warn_monitor.pose_stale_warnings == 1,
+        f"warnings={warn_monitor.pose_stale_warnings}",
+    )
+
+    # abort_recording() set STOP_EVENT; the gate cases below start clean.
+    collect_cap.ABORT_REASON = None
+    STOP_EVENT.clear()
+
+    # Start gate: with no Quest/cameras, live glove frames are enough.
+    class _FakeHand:
+        def __init__(self) -> None:
+            self.frames: queue.Queue[dict[str, Any]] = queue.Queue()
+            self.callback_count = 0
+
+    gate_args = types.SimpleNamespace(
+        pose_source="controller",
+        pose_side="right",
+        quest_ready_samples=10,
+        no_wait=True,
+        camera_start_timeout=1.0,
+    )
+    hand = _FakeHand()
+    stream = TimedStream(max_samples=10)
+    gate = StartGate(gate_args, None, stream, hand, [], [])
+    check("启动闸门/手套还没出帧不就绪", not gate.refresh())
+    for _ in range(10):
+        hand.frames.put(
+            {"timestamp_monotonic_ns": time.monotonic_ns()}
+        )
+        hand.callback_count += 1
+    check("启动闸门/手套连续出帧即就绪", gate.refresh())
+
+    # Cameras must start only after Quest/glove are ready. If is_ready (which
+    # includes the cameras) were the launch trigger, the gate would deadlock.
+    cam = _FakeCamera("cam0", progress=0)
+    hand = _FakeHand()
+    gate = StartGate(
+        gate_args, None, TimedStream(max_samples=10), hand, [cam], []
+    )
+    check(
+        "启动闸门/相机在源就绪前不启动",
+        not gate.is_ready() and not cam.started,
+    )
+    for _ in range(10):
+        hand.frames.put(
+            {"timestamp_monotonic_ns": time.monotonic_ns()}
+        )
+        hand.callback_count += 1
+    info = gate.wait()
+    check(
+        "启动闸门/源就绪后启动相机并完成（无死锁）",
+        cam.started
+        and info is not None
+        and info.camera_first_frame_s.get("cam0") is not None,
+        f"started={cam.started} info={info is not None}",
+    )
+
+    # The poller's deque can hold samples frozen before the gate; they must not
+    # count as "the pose just changed". The first refresh discards the backlog.
+    poller = _FakePoller(samples=100, valid_samples=100)
+    stream = TimedStream(max_samples=20)
+    for index in range(10):
+        stream.push(TimedSample(data=_pose_sample(index + 1, 0.5)))
+    hand = _FakeHand()
+    for _ in range(10):
+        hand.frames.put({"timestamp_monotonic_ns": time.monotonic_ns()})
+        hand.callback_count += 1
+    gate = StartGate(gate_args, poller, stream, hand, [], [])
+    gate.refresh()
+    check(
+        "启动闸门/待机缓冲不锚定冻结位姿",
+        gate.pose_watch.samples == 0 and not gate.sources_ready(),
+        f"samples={gate.pose_watch.samples}",
+    )
+    for index in range(10):
+        stream.push(
+            TimedSample(data=_pose_sample(100 + index, 0.5 + index * 0.001))
+        )
+    check(
+        "启动闸门/primed 后新样本有变化才算就绪",
+        gate.refresh(),
+        f"changes={gate.pose_watch.changes} ready={gate.sources_ready()}",
+    )
+
+    collect_cap.ABORT_REASON = None
+    STOP_EVENT.clear()
 
 
 def run_case(name: str, function: Any, *args: Any) -> None:
@@ -1808,6 +2297,13 @@ class _FakeCamera:
         self.failure = failure
         self.progress = progress
         self.stops = 0
+        self.started = False
+        self.start_monotonic_ns = 0
+
+    def start(self) -> None:
+        self.started = True
+        self.start_monotonic_ns = time.monotonic_ns()
+        self.progress = max(1, self.progress)
 
     def poll_health(self) -> None:
         if self.failure is not None:
@@ -1821,11 +2317,17 @@ class _FakeCamera:
 
 
 class _FakePoller:
-    """只实现运行期检查用到的两个属性，不起线程。"""
+    """只实现运行期检查用到的属性，不起线程。"""
 
-    def __init__(self, failure: Exception | None = None, samples: int = 0) -> None:
+    def __init__(
+        self,
+        failure: Exception | None = None,
+        samples: int = 0,
+        valid_samples: int = 0,
+    ) -> None:
         self.failure = failure
         self.samples = samples
+        self.valid_samples = valid_samples
         self.overruns = 0
 
 
@@ -1896,6 +2398,41 @@ def test_runtime_monitor() -> None:
         collect_cap.ABORT_REASON or "",
     )
 
+    monitor = fresh([], _FakePoller(samples=10, valid_samples=0))
+    monitor.QUEST_POLL_STALL_S = 1e9
+    monitor.QUEST_VALID_GRACE_S = 0.0
+    monitor.poll()
+    check(
+        "Quest 有样本但全无效即中止",
+        "没有任何有效 tracking" in (collect_cap.ABORT_REASON or ""),
+        collect_cap.ABORT_REASON or "",
+    )
+
+    monitor = fresh([], _FakePoller(samples=10, valid_samples=10))
+    monitor.QUEST_POLL_STALL_S = 1e9
+    monitor.QUEST_VALID_STALL_S = 0.0
+    monitor.poll()
+    check(
+        "有效 tracking 中断即中止",
+        "没有有效 tracking" in (collect_cap.ABORT_REASON or ""),
+        collect_cap.ABORT_REASON or "",
+    )
+
+    check(
+        "Quest 有效性/全零默认值无效",
+        not quest_sample_is_valid(
+            {"sdk_timestamp_ns": -1, "tracked": False}
+        ),
+    )
+    check(
+        "Quest 有效性/正时间戳有效",
+        quest_sample_is_valid({"sdk_timestamp_ns": 123, "tracked": False}),
+    )
+    check(
+        "Quest 有效性/tracked 为真有效",
+        quest_sample_is_valid({"sdk_timestamp_ns": -1, "tracked": True}),
+    )
+
     monitor = fresh([], None)
     monitor.GLOVE_STALL_S = 1e9
     monitor.poll()
@@ -1941,6 +2478,9 @@ def main() -> int:
         run_case("手别选择", test_pose_side_selection, tmp_root)
         run_case("启动失败工件", test_startup_failure, tmp_root)
         run_case("三源运行期检查", test_runtime_monitor)
+        run_case("启动闸门与位姿冻结", test_start_gate)
+        run_case("启动闸门 sequence floor", test_quest_sequence_floor, tmp_root)
+        run_case("无线 ADB", test_wireless_adb)
         if shutil.which("ffprobe"):
             run_case("相机命令", test_camera_command, tmp_root)
             run_case("相机预览", test_camera_preview, tmp_root)

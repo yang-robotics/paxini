@@ -53,13 +53,15 @@ ffmpeg 让每帧 pts 直接取主机墙钟并原样写进容器，停止后用 `
 
 ```bash
 cd Paxini-Cap/Cap_Quest
+source ../.venv/bin/activate          # 每个新终端都要
 python3.10 capture/collect_cap.py --list-devices
 ```
 
 ffmpeg 需要 5.0 以上（要 `-fps_mode`）。当前 Ubuntu 机器已经把静态版装在
 `/usr/local/bin`，`--list-devices` 会直接打印 `7.0.2-static`，**不用再 export
-`FFMPEG`**。换一台机器时才按 [`../README.md` §1.1](../README.md) 换静态版，或者
-`export FFMPEG=/path/to/ffmpeg-5-or-newer` 指过去。
+`FFMPEG`**。换一台机器时才按 [`../README.md` §1.1](../README.md) 换静态版，或者用
+`--ffmpeg /path/to/ffmpeg-5-or-newer` / `export FFMPEG=...` 指过去。查找顺序是
+`--ffmpeg` → `$FFMPEG` → `PATH`。
 
 `--list-devices` 打印串口（含 USB VID:PID 与 by-id）、视频设备和 ffmpeg 版本。
 先确认两件事：
@@ -69,11 +71,16 @@ ffmpeg 需要 5.0 以上（要 `-fps_mode`）。当前 Ubuntu 机器已经把静
 - **V4L2 节点数量对得上**。两路 MASTER Camera 应各有一个 `index 0` 采集节点；
   一个都没有说明相机没被内核识别，先 `v4l2-ctl --list-devices` 看设备在不在。
 
-确认无误后再运行：
+确认无误后再运行（三路全采）：
 
 ```bash
-python3.10 capture/collect_cap.py --cap-side right --pose-source controller --pose-side right
+python3.10 capture/collect_cap.py \
+  --cap-side right --pose-source controller --pose-side right \
+  --start-pc-service
 ```
+
+`--start-pc-service` 会用 `bash` 拉起 `/opt/apps/roboticsservice/runService.sh`；PC Service
+已经在跑时直接复用。不要加 `--no-quest`，那是只采手套 + 相机的模式。
 
 常见变体：
 
@@ -84,36 +91,55 @@ python3.10 capture/collect_cap.py --no-quest           # 没有头显时只采�
 python3.10 capture/collect_cap.py --camera-mode none   # 不录视频
 ```
 
-**三个来源各自启动，互不等待**（2026-11-20 起；2026-11-23 删掉就绪期）。
-**配置了就算必需**：哪一路停了，整场录制就中止，不再有「缺一路照样录完」的降级。
+**启动分两段：先待机就绪，再按键开录**（2026-11-27 起）。
+**配置了就算必需**：哪一路停了，整场录制就中止。
 
 ```text
 手套       始终必需。连接/启动失败 → 按启动失败退出，不生成 data.h5
-相机       由 --camera-mode 决定。启动失败 → 启动失败退出（只录一路用 --camera-mode cam0）
-Quest      由 --no-quest 决定。装配失败（PC Service / ADB / SDK）→ 启动失败退出，不生成 data.h5
+相机       由 --camera-mode 决定。任一路打不开或等不到首帧 → 启动失败退出
+Quest      由 --no-quest 决定。装配失败（PC Service / ADB / SDK）→ 启动失败退出
 ```
 
-不戴头显就别靠“配了但没连”蒙混过去：显式加 `--no-quest`，否则程序按「配置了就得在场」
-处理，直接判启动失败。
+待机顺序（`StartGate`）：
 
-启动阶段没有就绪检测、也不等待。检查全部发生在采集循环里（`RuntimeMonitor`）：
+1. Quest poller 与手套连续采集先跑起来；
+2. 等到 `--quest-ready-samples` 条**选定位姿**连续有效，且最近 0.5 s 内位姿有变化
+   （防手柄休眠/冻结），同时手套真实出帧；
+3. 这时才 `camera.start()`，等每路首帧（`--camera-start-timeout` 默认 15 s，实测 1–2.5 s）；
+4. 终端打印「准备完毕」，等你按**任意一个键**（不用回车）；
+5. 按键才创建 `data.h5`、清空 Quest/手套的待机缓冲、开始写行；相机继续录。
+
+所以：
+
+- **Quest/手套没有按键前的行**。待机期丢弃了多少记在
+  `manifest.quest.standby_samples_discarded` / `manifest.hand.standby_frames_discarded`。
+- **相机 mkv 有按键前的预录**（相机先起是历史行为，也是“就绪=真的出图”的代价）。
+  `manifest.cameras.per_camera.<id>.pre_roll_s` 记这段长度；下游 Align 按公共窗口
+  丢掉，不影响对齐产物。
+- `data.h5` 只在按键后创建；待机期按 Ctrl+C 写 `startup_failure.json`，不会生成空 HDF5。
+- 非 TTY（nohup/管道）必须加 `--no-wait`（就绪后自动开始），否则启动前直接报错。
+- `--duration` 从按键那刻开始计时。
+
+启动阶段之后，运行期检查（`RuntimeMonitor`）继续跑：
 
 | 检查 | 频率 | 判据 | 处置 |
 |---|---|---|---|
 | 相机进程 | 1 Hz | `process.poll()` 非空 | 中止整场 |
 | 相机出帧 | **0.5 Hz** | 启动宽限（`--camera-start-timeout`，15 s）过后 4 s 进度不增长；从没出过帧也走这一条 | 中止整场 |
-| Quest 轮询 | 1 Hz | `failure` 非空（线程内异常，`QuestPoller` 自己也会中止）；或 5 s 内 `samples` 不增长（线程卡在 SDK 调用里） | 中止整场 |
-| 手套出帧 | 每帧记时刻 | 连续 3 s 无新帧（没有宽限期：手套要么立刻出数，要么就是坏了） | 中止整场 |
+| Quest 轮询 | 1 Hz | `failure` 非空；或 5 s 内 `samples` 不增长（线程卡在 SDK 调用里） | 中止整场 |
+| Quest 数据有效性 | 1 Hz | 启动 10 s 宽限后 `valid_samples` 仍为 0；或出过有效数据后 5 s 不更新 | 中止整场 |
+| **Quest 选定位姿冻结** | 1 Hz | 选定位姿连续 **5 s** 逐位不变（手柄休眠/丢追踪）；**1 s 先 warn** | 中止整场 |
+| 手套出帧 | 每帧记时刻 | 连续 3 s 无新帧（没有宽限期） | 中止整场 |
 
 中止不是崩溃：走 `abort_recording()` → `STOP_EVENT` → 正常收尾（排空队列、停相机、
-回填视频时间戳、写 manifest），`manifest.error` 写明原因，退出码 2。所以「中止」的
-产物是可读的，不是半份垃圾。
+回填视频时间戳、写 manifest），`manifest.error` / `manifest.runtime.abort_reason`
+写明原因，退出码 2。所以「中止」的产物是可读的，不是半份垃圾。
 
-`cameras.first_frame_s` 是「第一次采样看到进度增长」的时刻，受 0.5 Hz 采样限制，
-精度是 2 s 的整数倍，别拿它当精确的首帧延迟。
+`cameras.first_frame_s` 现在是「`camera.start()` → 第一帧」的秒数（启动闸门实测），
+不再受运行期 0.5 Hz 采样限制；`pre_roll_s` 是「第一帧 → 按键」。
 
 **没配置的源不检查**：`--camera-mode none` 时相机列表为空，一条相机检查都不会跑；
-`--no-quest` 时压根没有轮询线程。三路的起止时刻必然不同，manifest 分别记
+`--no-quest` 时压根没有轮询线程。三路的起止时刻仍然不同，manifest 分别记
 `hand.first/last_timestamp_unix_ns`、`cameras.per_camera.<id>.first/last_timestamp_unix_ns`、
 `quest.first/last_sdk_timestamp_ns`。
 
@@ -132,11 +158,12 @@ Quest      由 --no-quest 决定。装配失败（PC Service / ADB / SDK）→ �
 
 原来有一份 `scripts/run_capture_noquest.sh`，把「找 ffmpeg → 查串口 → 关 NTP → 起采集 →
 读 manifest 核对行数」串成一条命令。2026-11-20 删除：它维护的东西（ffmpeg 位置、设备节点、
-参数拼装）与 `collect_cap.py --help` 完全重复，而且三源解耦之后启动条件不再是「先查齐再跑」，
-脚本那套前置检查反而会挡住合法的部分采集（比如只接一路相机）。
+参数拼装）与 `collect_cap.py --help` 完全重复。2026-11-27 起启动闸门已经内置在程序里
+（Quest/手套真的出数、相机真的出首帧才提示按键），更不需要外面再查一遍；脚本那套前置
+检查反而会挡住合法的部分采集（比如只接一路相机）。
 
 现在就是两条命令，顺序别改（ffmpeg 已装在 `/usr/local/bin`，换机器才需要
-`export FFMPEG=...`）：
+`--ffmpeg ...` 或 `export FFMPEG=...`）：
 
 ```bash
 sudo timedatectl set-ntp false
@@ -144,8 +171,8 @@ python3.10 capture/collect_cap.py --no-quest          # 没有头显时
 ```
 
 要采固定时长加 `--duration 60`，要边采边看加 `--view`，其余参数一律以 `--help` 为准。
-采完怎么判合格（行数、`row_mismatch`、每路帧数、视频体积）见 §4 与 `../QUICKSTART.md` 的
-「合格检查」。
+采完怎么判合格（行数、`row_mismatch`、每路帧数、视频体积）见 §4 与
+[`QUICKSTART.md`](QUICKSTART.md) 的「5. 检查产物」。
 
 #### 换一台机器要改什么
 
@@ -154,7 +181,7 @@ python3.10 capture/collect_cap.py --no-quest          # 没有头显时
 
 | 项 | 本机现状 | 别人怎么办 |
 |---|---|---|
-| Python | 系统 `python3` 是 3.12，`PxCap3` 只在 `python3.10` 里 | 用 `python3.10`（或 `PYTHON=` 指定） |
+| Python | 系统 `python3` 是 3.12，`PxCap3` 只在 `python3.10` 里 | 用 `Paxini-Cap/.venv`（`--system-site-packages`，见 [`../README.md` §1.0](../README.md)），每个新终端先 `source ../.venv/bin/activate` |
 | 手套 SDK | `pxhandsdk 1.0.0.0` 已 `dpkg` 装 | 装 SDK + `setup-serial-access.sh` + 重登让 `dialout` 生效 |
 | ffmpeg | 静态版 7.0.2 在 `/usr/local/bin` | 5.0 以上，需带 `v4l2` 输入与 `-fps_mode`，装法见 [`../README.md` §1.1](../README.md) |
 
@@ -239,14 +266,17 @@ HDF5 只存索引性质的时间戳。
 
 | 字段 | 内容 |
 |---|---|
-| `rows` / `quest_rows` | 手套帧数 N / Quest 样本数 Q |
+| `started_at` / `ended_at` | **按键开始**的本地时间 / manifest 写出时刻 |
+| `rows` / `quest_rows` | 手套帧数 N / Quest 样本数 Q（都不含待机期） |
+| `quest.valid_rows` | 真正带 tracking 数据的 Quest **已写入**行数（`sdk_timestamp_ns > 0` 或 `tracked`）；全 0 说明头显没戴/APK 暂停 |
 | `actual_rate_hz` | 按首末帧**单调钟**跨度算的实际频率 |
-| `duration_s` / `sample_span_s` | 墙钟耗时 / 手套首末帧跨度 |
+| `duration_s` / `sample_span_s` | 从按键算起的墙钟耗时 / 手套首末帧跨度 |
 | `alignment` | 固定 `none (raw per-source timestamps only)` |
-| `hand` | 手别 `side`、Quest 请求手别 `pose_side_requested`、串口、SN、SDK/固件版本、故障、回调耗时、队列溢出、**首末帧时刻** `first/last_timestamp_unix_ns` 与 `first/last_timestamp_monotonic_ns` |
-| `quest` | enabled、rows、samples_dropped、轮询次数与超时（`poller_overruns`）、`poller_alive`、**`errors`**（被 `XrtReader.call` 吞掉的 getter 异常，按接口名各记一条）、**首末 SDK 时间戳** `first/last_sdk_timestamp_ns`（域未验证，只作增量参考） |
-| `cameras` | 每路设备、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s`；汇总 `first_frame_s` |
-| `runtime` | `abort_reason`（中止原因，正常结束为 null）、`configured_sources`、出帧检查频率与两个停滞阈值、`camera_stalls` / `glove_stalls` |
+| `session` | `started_at` / `started_unix_ns` / `started_monotonic_ns`（按键）、`ready_wait_s`、`key_wait_s`、`auto_start`（`--no-wait`）、待机丢弃数 |
+| `hand` | 手别 `side`、Quest 请求手别 `pose_side_requested`、串口、SN、SDK/固件版本、故障、回调耗时、队列溢出、`standby_frames_discarded`、**首末帧时刻** `first/last_timestamp_unix_ns` 与 `first/last_timestamp_monotonic_ns` |
+| `quest` | enabled、rows、`valid_rows`、`first_sequence` / `last_sequence`、`standby_samples_discarded`、`selected_pose`（判据、待机/运行期变化次数、`stale_max_s`、`stale_warnings`）、samples_dropped、轮询次数与超时（`poller_overruns`）、`poller_alive`、**`errors`**、**首末 SDK 时间戳**（域未验证） |
+| `cameras` | 每路设备、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s`（`camera.start()`→首帧）、`pre_roll_s`（首帧→按键）；汇总 `first_frame_s` |
+| `runtime` | `abort_reason`、`configured_sources`、出帧检查频率与各自停滞阈值（含 `quest_valid_*`、`quest_pose_*`）、`camera_stalls` / `glove_stalls` |
 | `verify` | 行数自检（`row_mismatch` 必须为空） |
 | `env` | python / numpy / h5py / ffmpeg 版本 |
 
@@ -353,11 +383,13 @@ python3.10 diagnostics/quest_clock_probe.py \
 
 报告检查有效时间戳覆盖率、探针有效时长、时间戳倒退、长时间重复冻结、相对主机
 Unix 时钟的残差和时钟斜率。默认阈值为有效覆盖 ≥95%、有效时长 ≥目标的 95%、
-同一时间戳连续重复 ≤10 个轮询周期、残差中位数 ≤10 ms、p99 ≤30 ms、
-斜率误差 ≤100 ppm。
+**同一时间戳持续 ≤1 s**、残差中位数 ≤10 ms、p99 ≤30 ms、斜率误差 ≤100 ppm。
+重复判据按持续时长算，不按连续行数：120 Hz 轮询下同一时间戳重复 20 多行（≈0.2 s）
+是正常的，只有持续超过 1 s 才判时钟冻结。
 
 现有 `data_20261118_1` 不满足文件级门控：有效时间戳比例 90.4%，最长同一时间戳
-连续重复 5472 次，因此即使提供一份通过的时钟探针报告，查看器也会拒绝对齐该文件。
+连续重复 5472 次（120 Hz 下约 45 s），因此即使提供一份通过的时钟探针报告，
+查看器也会拒绝对齐该文件。
 
 只有报告为 `passed=true` 且 `clock_domain=unix_epoch`，才允许显式启用对齐：
 
@@ -548,7 +580,8 @@ view: false              # 采集时开实时窗口
 - 换一份：`python3.10 capture/collect_cap.py --config /path/to/other.yaml`。**旧的 `.json`
   也能直接用**——YAML 是 JSON 的超集，解析器不看扩展名。
 - 未知键、非法选项值、布尔写成 `"yes"` 都会直接报错退出（退出码 2），不静默忽略。
-- 改完想确认最终生效值：`--help` 里显示的 `(default: ...)` 就是配置文件改写后的默认值。
+- `--help` 显示的是**内置默认值**：argparse 在加载配置之前就打印并退出，配置文件
+  只在真正启动时生效。改完用一次 `--list-devices` 看首行「已加载配置：…（N 项）」确认文件被读。
 
 ### 6.2 参数表
 
@@ -564,13 +597,16 @@ view: false              # 采集时开实时窗口
 | `--pose-source` | `controller` | `controller` / `hand` / `head`，只影响 `pose_6d` |
 | `--pose-side` | `auto` | `auto` 跟随 `--cap-side`；`left` / `right` 可显式覆盖 |
 | `--quest-rate` | `120` | Quest 轮询频率 |
+| `--quest-ready-samples` | `10` | 判就绪所需的连续有效选定位姿样本数；另要求最近 0.5 s 位姿有变化 |
+| `--no-wait` | 关 | 就绪后不等待按键，立即开始；非 TTY/自动化用 |
 | `--camera-mode` | `both` | `both` / `cam0` / `cam1` / `none` |
 | `--no-cameras` | 关 | 等价 `--camera-mode none` |
 | `--camera-0` / `--camera-1` | `auto` | 指定 `/dev/videoN`；auto 按 sysfs 设备路径排序 |
 | `--camera-width` / `--camera-height` | `1280` / `720` | 请求分辨率 |
 | `--camera-fps` | `30` | 请求帧率 |
-| `--camera-start-timeout` | `15` | 每路相机的启动宽限；宽限后 4 s 无新帧即中止整场 |
+| `--camera-start-timeout` | `15` | 启动闸门等每路首帧的上限；运行期继续作为停滞宽限（宽限后 4 s 无新帧即中止） |
 | `--video-codec` | `copy` | `copy`（MJPEG 直通）/`h264`/`hevc`/`mjpeg` |
+| `--ffmpeg` | `auto` | ffmpeg 路径；`auto` = 先 `$FFMPEG` 再 `PATH`，需 5.0+（带 `-fps_mode`） |
 | `--duration` | `0` | 采集秒数，0 表示到 Ctrl+C |
 | `--output-dir` | — | 默认 `<Paxini-Cap>/Recordings/data_<日期>_<序号>` |
 | `--omit-distribution` | 关 | 不写 444 点分布力 |
@@ -579,16 +615,19 @@ view: false              # 采集时开实时窗口
 | `--view-fps` | `20` | 实时窗口刷新率（`tk` 模式） |
 | `--view-video-fps` | `5` | 相机缩略图的抽帧帧率（`--view` 打开时生效） |
 | `--view-video-width` | `360` | 相机缩略图宽度，高度按比例 |
-| `--no-quest` | 关 | 不采 Quest，跳过 PC Service/ADB 与 pose 等待 |
+| `--no-quest` | 关 | 不采 Quest，跳过 PC Service/ADB；启动闸门只等手套与相机首帧，不再等 Quest |
 | `--skip-adb` | 关 | 不装/不启动 Quest APK |
 | `--allow-usb-only` | 关 | 兼容旧参数；有 USB ADB 时本来就保留 USB |
 | `--apk` / `--package` / `--adb` / `--serial` / `--quest-ip` / `--adb-port` | — | Quest 连接参数 |
-| `--start-pc-service` / `--pc-service-script` / `--no-pc-service-check` | — | PC Service 管理 |
+| `--quest-wireless` | 关 | 优先无线 ADB：mDNS 发现 + 需要时提示配对码，失败回退 USB |
+| `--start-pc-service` / `--pc-service-script` / `--no-pc-service-check` | — | PC Service 管理；启动时用 `bash` 调厂商脚本（脚本无 shebang） |
 | `--config` | `cap_config.yaml` | 配置文件路径（YAML；旧的 JSON 也能解析） |
 
-ffmpeg/ffprobe 从 `PATH` 找，也认环境变量 `FFMPEG`。只是要 5.0 以上——apt 的
-22.04 版是 4.4.2，没有 `-fps_mode`，相机那一路会在启动时就失败。装法见
-[`../README.md` §1.1](../README.md)。
+ffmpeg 按 `--ffmpeg` → `$FFMPEG` → `PATH` 的顺序找（`visualize.py` 和
+`measure_camera_latency.py` 也认这个参数；它们默认 `None`，`collect_cap.py` 默认 `auto`，
+最终都回落到 `$FFMPEG`/`PATH`）；ffprobe 优先取 ffmpeg 同目录的兄弟文件，没有再查 `PATH`。
+只是要 5.0 以上——apt 的 22.04 版是 4.4.2，没有 `-fps_mode`，相机那一路会在启动时就失败。
+装法见 [`../README.md` §1.1](../README.md)。
 
 ### 6.3 相机：只有 V4L2
 
@@ -658,6 +697,11 @@ ls -l /dev/serial/by-id/ /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 | `检测到多个串口` | 有别的 CDC 设备；用 `--hand-port` 指定 |
 | 相机节点为 0 | 内核没识别到 UVC；`v4l2-ctl --list-devices` 与 `dmesg | tail` 对照 |
 | `等待 PXCap camX 摄像头画面超时` | 分辨率/帧率不被支持，先降到 640x480 / 15 fps |
+| 启动后一直停在 `[等待就绪]` | 看状态行：Quest 连续有效计数不涨 → 头显没戴/APK 没开 Tracking；计数涨但“最近变化”一直变大 → 手柄休眠，拿动一下；手套 0 帧 → 串口；相机没起 → 等 Quest/手套就绪后才会 `start()`。不想等 Quest 就加 `--no-quest` |
+| 「准备完毕」后按键没反应 | 终端焦点不在程序窗口；或者 stdin 不是终端（nohup/管道），确认启动时没有直接报错；自动化用 `--no-wait` |
+| 视频开头有一段按键前的画面 | 预期：相机先起并等首帧，按键才开始写 `data.h5`。`manifest.cameras.*.pre_roll_s` 记长度，下游 Align 会按公共窗口丢掉 |
+| Quest 曲线末尾变成一条水平线 | 右手柄休眠/丢追踪，头显还在更新所以 `tracked` 仍为 true；`SelectedPoseWatch` 5 s 后会中止整场（1 s 先 warn）。看 `manifest.quest.selected_pose` |
+| Quest 和相机整体差约 2.5 s | SDK 时间戳比主机 Unix 快约 2.55 s，默认 `unix` 对齐会原样带过去；跑 C8 探针并走 `--quest-align sdk_unix`，见 `DOC/时间戳说明.md` |
 | `时间戳不是墙钟时间` | ffmpeg 太老或命令被改；确认 `-use_wallclock_as_timestamps 1` |
 | 一直"尚未收到 PXCap 连续采集帧" | 串口占用、回调异常；看 manifest 的 `snapshot_errors` |
 | 相机 `actual_fps` 明显低于 30 | USB 带宽不够（两路 720p30 挂在同一个 Hub 上很常见）；换端口或降分辨率 |
@@ -703,7 +747,7 @@ ls -l /dev/serial/by-id/ /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 | 项 | 结果 |
 |---|---|
 | `py_compile` / `pyflakes` | 全过，0 告警 |
-| `selftest.py` | 151 项，通过 150（在原有覆盖之外增加 C8 时钟探针、sdk_unix 报告与文件质量门控、Quest unix 模式免报告对齐、独立时间轴/sequence 降级、失败工件、三源运行期检查 8 项）。唯一失败项是「启动失败工件」，本机缺 `ffprobe` 导致，装好 ffmpeg 的机器上应全过 |
+| `selftest.py` | 当前 **206 项全过**（含无线 ADB、USB 回退、Quest 有效性、三源运行期检查、启动闸门/位姿冻结；装好 ffmpeg/ffprobe 的机器上不跳过相机组） |
 | `--list-devices` | 正常输出串口 / V4L2 节点 / ffmpeg |
 | 无设备时报错 | 退出码 **2**，保留 `startup_failure.json`，不创建 `data.h5` |
 | 相机延迟测量 | **两路都尚未实测**；任何旧路径的数都已经作废，不能沿用 |
@@ -719,6 +763,10 @@ ls -l /dev/serial/by-id/ /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 
 ### 10.2 未执行
 
+- **启动闸门（待机 + 按键）真机未验证**：代码与 selftest 全过，但还没在真机上按过键。
+  下一台真机要验：`[准备完毕]` 出现时 Quest/手套/相机都真的在出数、按键后 `quest/`
+  第一行在按键之后（`manifest.session.started_at` / `quest.first_sequence`）、相机
+  `pre_roll_s` 与 mkv 开头一致、拔掉手柄 5 s 后 T3 中止并留下可读文件。
 - **Quest 跨源时间域**：XRoboToolKit 真机采集已跑通，`sdk_timestamp_ns` **约定**为主机
   墙钟，下游据此默认对齐；但 C8 探针一直没跑，所以这个约定**没有实证**，产物里
   `quest.clock_domain_verified=false` 会一直挂着。要留证据就跑上面的 C8 探针再走 `sdk_unix`。

@@ -107,17 +107,24 @@ dpkg-deb --build --root-owner-group "$WORK" pxhandsdk_1.0.0.0.ubantu2204_amd64.p
 
 ```bash
 # 启动（脚本末尾是 ./RoboticsServiceProcess &，命令会立即返回）
-/opt/apps/roboticsservice/runService.sh
+# 用 bash 调：脚本没有 shebang，直接执行靠 shell 兜底
+bash /opt/apps/roboticsservice/runService.sh
 
 # 确认在跑
 ps -eo pid,cmd | grep [R]oboticsServiceProcess
 ```
 
-或者让采集程序代劳（内部用 `start_new_session=True`，不受终端关闭影响）：
+或者让采集程序代劳（`start_new_session=True`，不受终端关闭影响）：
 
 ```bash
-python3.10 collect_cap.py --start-pc-service ...
+cd ../Cap_Quest          # 从 Paxini-Cap/sdk/ 进入采集工程
+python3.10 capture/collect_cap.py --duration 60 --start-pc-service
 ```
+
+**`runService.sh` 没有 shebang**（首行是 `DIR=$(...)`，还用到了 bash 的
+`BASH_SOURCE`），所以不能被 `execve` 直接执行。在 shell 里 `./runService.sh` 能跑是
+因为 bash 会兜底；Python 直接 `Popen([script])` 会得到 `Exec format error`。采集程序
+因此固定用 `bash` 调这个脚本——不要改成直接执行。
 
 不加 `--start-pc-service` 时，检测不到服务只会打警告，不会退出（`--no-quest`
 本来就不需要它）。

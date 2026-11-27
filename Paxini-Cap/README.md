@@ -80,8 +80,8 @@ Paxini-Cap/
    该值等于真正写进数组的点数。
 4. **回调线程只拷贝。** `snapshot_cap_frame` 跑在 SDK 线程里，只做 numpy 拷贝入队；
    写盘全部在主线程 `pump_and_record`。
-5. **`quest3.py` 已与 `Dex_Quest/quest3.py` 分叉。** 差异只在 `collect_sample`
-   和模块 docstring，不要再追求两份一致。
+5. **`quest3.py` 已与 `Dex_Quest/quest3.py` 分叉。** Cap 侧另有无线 ADB 配对/发现、
+   `pc_service_command()` 等逻辑，Dex 侧没有；不要再追求两份一致。
 6. **`DOC/HDF5结构说明.md` 被用户手动编辑过**，只能定点修改，禁止整份重写。
 7. **改 `cap/` 或 `quest/` 的布局必须升 `format_version`**（当前 `4`），并在
    `HDF5结构说明.md` 的版本变更表里写清改了什么。下游按版本号判断怎么读。
@@ -123,6 +123,7 @@ Paxini-Cap/
 
 ```bash
 cd Cap_Quest
+source ../.venv/bin/activate             # 在 Paxini-Cap/.venv 里跑
 python3.10 -m py_compile capture/*.py viewer/*.py selftest/*.py latency/*.py calib/*.py diagnostics/*.py
 python3.10 -m pyflakes capture/*.py viewer/*.py selftest/*.py latency/*.py calib/*.py diagnostics/*.py
 python3.10 selftest/selftest.py          # 应为全过
@@ -138,16 +139,34 @@ python3.10 selftest/selftest.py          # 应为全过
 | 项 | 要求 |
 |---|---|
 | 系统 | Ubuntu 22.04 / 24.04（原生安装） |
-| Python | **`python3.10`**。系统 `python3` 是 3.12，此时 `import pxhandsdk` 能过但 `hasattr(pxhandsdk,"PxCap3")` 为 False |
+| Python | **`python3.10`**。`python3` 在装了 conda 的机器上可能指向 3.12/3.14，此时 `import pxhandsdk` 能过但 `hasattr(pxhandsdk,"PxCap3")` 为 False；一律显式写 `python3.10` |
 | 手套 SDK | `pxhandsdk 1.0.0.0`，`dpkg -i` 装到 `/usr/lib/python3/pxhandsdk` |
-| Python 包 | `numpy>=1.24` / `h5py>=3.8` / `pyyaml>=6` / `matplotlib>=3.7` / `xrobotoolkit-sdk`，用 `python3.10 -m pip install --user -r requirements.txt` |
+| Python 包 | `numpy>=1.24` / `h5py>=3.8` / `pyyaml>=6` / `matplotlib>=3.7` / `xrobotoolkit-sdk`，装在 `Paxini-Cap/.venv` 里（建法见下） |
 | 延迟测量额外包 | `opencv-python` / `qrcode[pil]`（生成并解码二维码，只有 `latency/` 用；已在 `requirements.txt` 里） |
 | 回放 | `matplotlib`（随 requirements 装）；窗口模式还要 `python3.10-tk`，`--html` 不需要 |
 | 系统工具 | `v4l-utils`（`v4l2-ctl`，排查相机）、`libgl1`（`opencv-python` 依赖）、`adb`（Quest） |
 | ffmpeg | **5.0 以上**，需带 `v4l2` 输入、`-fps_mode`、`ffprobe`。apt 的 22.04 版是 4.4.2，**没有 `-fps_mode`，跑采集会在相机启动那一步失败**，必须换静态版，装法见 §1.1 |
 
-不要用 `python3.10 -m venv`：这个环境里 ensurepip 会失败，直接用系统 3.10 加
-`--user` 装包。
+### 1.0 Python 环境：`Paxini-Cap/.venv`（只做一次）
+
+```bash
+# 从仓库根目录执行
+cd Paxini-Cap
+# 用系统解释器建，避免 conda/旧 venv 的 python3.10 抢先
+/usr/bin/python3.10 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install --ignore-installed -r requirements.txt
+python3.10 -c "import pxhandsdk; print('PxCap3:', hasattr(pxhandsdk,'PxCap3'))"   # 必须 True
+```
+
+- **必须 `--system-site-packages`**：`pxhandsdk` 是 deb 装到
+  `/usr/lib/python3/pxhandsdk/dist-packages`，纯 venv / conda 都看不到它，手套会起不来。
+- **必须 `--ignore-installed`**：否则 pip 会复用 `~/.local` 里的 numpy，回放 matplotlib
+  又会被其他工程带崩（`_ARRAY_API not found`）。
+- 之后每个新终端先 `source Paxini-Cap/.venv/bin/activate`；`Cap_Quest/`、`Paxini-Align/`、
+  `py_demo/` 共用这一个环境。`Paxini-Dex/.venv` 是另一套，别混用。
+- `PxCap3` 不是 `True` 时不用重建，软链一次：
+  `ln -sfn /usr/lib/python3/pxhandsdk/dist-packages/pxhandsdk .venv/lib/python3.10/site-packages/`。
 
 ### 1.1 ffmpeg：换静态版（必做一次）
 
@@ -176,6 +195,13 @@ ffmpeg -hide_banner -h full | grep -c fps_mode    # 非 0
 `Unrecognized option 'fps_mode'`，表现为相机一路起不来、`data.h5` 里没有
 `cameras/`，很容易误判成 USB 带宽问题。
 
+机器上已有别的软件自带的 5.0+ 静态版时，`wget` 这一步可以省掉：把它的 `ffmpeg` 和
+`ffprobe` **两个一起**复制到 `/opt/ffmpeg-7.0.2/`，再建同样的软链。两个必须同版本，
+用 `ffmpeg -version` / `ffprobe -version` 核对。
+
+装完由 `PATH` 生效；也可以不改系统目录，改用 `--ffmpeg /opt/ffmpeg-7.0.2/ffmpeg` 或
+`export FFMPEG=...` 指给单个程序（采集、回放、延迟测量三个入口都认）。
+
 **不要用 `-nostdin`。** ffmpeg 7 带 `-nostdin` 时会吞掉第一次 SIGINT，容器收不了尾
 （详见 [`agent/pitfalls.md`](../agent/pitfalls.md)）；代码里已经去掉，靠
 `stdin=DEVNULL` 达到同样效果。
@@ -191,27 +217,42 @@ Quest 数据链路不是只装一个 Python 包就能工作。开始采集前必
 | PC Service | 已安装 `XRoboToolkit_PC_Service_1.0.0_ubuntu_22.04_amd64.deb`，`RoboticsServiceProcess` 常驻运行 |
 | Python SDK | `xrobotoolkit-sdk` 必须装在采集程序使用的同一个 `python3.10` 环境中 |
 | Quest APK | APK 位于 `sdk/xrobotoolkit/XRoboToolkit-Quest-1.0.1.apk`，包名为 `com.xrobotoolkit.client.quest`；二进制未入库，下载与校验见 [`sdk/README.md`](sdk/README.md) |
-| 网络 | Quest 与运行 PC Service 的主机位于可互通的局域网；首次配置时无线 ADB 默认使用 `5555` |
-| 头显设置 | 进入 XRoboToolKit 后保持 APK 运行，并开启 **Tracking** 和 **Send**；手柄需要唤醒 |
+| 网络 | Quest 与运行 PC Service 的主机位于可互通的局域网；无线 ADB 端口由 mDNS 发现（旧式 `adb tcpip 5555` 仅作兼容） |
+| 头显设置 | 进入 XRoboToolKit 后保持 APK 运行，并开启 **Tracking** 和 **Send**；手柄需要唤醒。**采集期间必须戴上并解锁头显**，否则 APK 暂停、Quest 数据全零，10 s 后会中止 |
+| 无线 ADB（可选） | 头显里打开 **Wireless debugging**；采集加 `--quest-wireless`，配对码按提示输入，端口由 mDNS 发现，失败回退 USB |
 
-PC Service 不会开机自启，采集程序默认也不会替你启动。每次开始 Quest 采集前，先在一个终端运行：
+PC Service 不会开机自启。两种起法，二选一：
+
+**A. 手动起**（任意 shell 都行；脚本没有 shebang，bash 会兜底）：
 
 ```bash
 cd /opt/apps/roboticsservice
-./runService.sh
+bash ./runService.sh
 ps -eo pid,cmd | grep '[R]oboticsServiceProcess'
 ```
 
+**B. 让采集程序代起**：在采集命令里加 `--start-pc-service`，它会用 `bash` 跑同一个脚本
+（完整命令见 [`Cap_Quest/QUICKSTART.md`](Cap_Quest/QUICKSTART.md)）。
+
 `runService.sh` 自己设置动态库、Qt 插件和 QML 路径，并以后台进程启动
 `RoboticsServiceProcess`。不要只运行 `RoboticsServiceProcess`，也不要运行 `run3D.sh`
-（没有显示环境时会失败）。PC Service 监听 `*:63901` 和 `127.0.0.1:60061`；
+（没有显示环境时会失败）。
+
+**这个脚本没有 shebang**（首行是 `DIR=$(...)`，且用了 bash 的 `BASH_SOURCE`），所以不能
+被 `execve` 直接执行：shell 里 `./runService.sh` 能跑是因为 bash 自己兜底，而 Python 的
+`subprocess.Popen([script])` 会报 `Exec format error`。`--start-pc-service` 因此固定用
+`bash` 调用它（`quest3.pc_service_command()`），别再改回直接 exec。
+
+PC Service 监听 `*:63901` 和 `127.0.0.1:60061`；
 Quest 跟踪数据通过局域网进入前者，所以头显和主机必须在同一个可达网段，主机防火墙
 要放行 63901。
 
-安装并确认 Python SDK 可用：
+安装并确认 Python SDK 可用（装进 `Paxini-Cap/.venv`，见 §1.0；在仓库根目录执行）：
 
 ```bash
-python3.10 -m pip install --user xrobotoolkit-sdk
+cd Paxini-Cap
+source .venv/bin/activate
+pip install xrobotoolkit-sdk
 python3.10 -c "import xrobotoolkit_sdk; print('xrobotoolkit_sdk OK')"
 ```
 
@@ -219,6 +260,7 @@ python3.10 -c "import xrobotoolkit_sdk; print('xrobotoolkit_sdk OK')"
 
 ```bash
 cd Paxini-Cap/Cap_Quest
+source ../.venv/bin/activate
 python3.10 capture/quest3.py --duration 10
 ```
 
@@ -248,6 +290,9 @@ PC Service、Quest Wi-Fi、APK 的 Tracking/Send 开关和手柄唤醒状态。
 ## 3. 安装（只做一次）
 
 ```bash
+# 在仓库根目录执行
+cd Paxini-Cap
+
 # 系统依赖
 sudo apt install -y python3.10-tk v4l-utils libgl1
 
@@ -257,8 +302,9 @@ sudo /usr/share/pxhandsdk/scripts/setup-serial-access.sh
 sudo usermod -aG dialout "$USER"
 # 重新登录让 dialout 生效
 
-# Python 依赖（含延迟测量用的 opencv / qrcode）
-python3.10 -m pip install --user -r requirements.txt
+# Python 依赖（含延迟测量用的 opencv / qrcode）——先按 §1.0 建好并使用 venv
+source .venv/bin/activate          # 已在 Paxini-Cap/ 下
+pip install --ignore-installed -r requirements.txt
 
 # ffmpeg 5.0+（apt 的 4.4.2 不够），见 §1.1
 ```

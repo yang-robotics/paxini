@@ -48,7 +48,8 @@ try:
 except ImportError as exc:  # pragma: no cover - dependency guard
     print(
         f"[错误] 缺少依赖：{exc}。请运行 "
-        "python3.10 -m pip install --user numpy h5py",
+        "请在 Paxini-Cap/.venv 里 "
+        "pip install --ignore-installed -r requirements.txt（见 QUICKSTART 第 1 步）",
         file=sys.stderr,
     )
     raise SystemExit(2)
@@ -558,6 +559,10 @@ def collect_payload(
                 alignment=quest_alignment,
                 cap_unix_ns=cap_unix_first_ns,
                 clock_report=quest_clock_report,
+                poll_rate_hz=float(
+                    ((manifest.get("quest") or {}).get("poll_rate_hz"))
+                    or 120.0
+                ),
             )
             if (
                 quest_payload is not None

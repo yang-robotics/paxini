@@ -141,8 +141,9 @@
 
 ### 10. `quest3.py` 两边已分叉
 
-**规则**：`Cap_Quest/capture/quest3.py` 与 `Dex_Quest/quest3.py` 差异在
-`collect_sample` 和模块 docstring，不要再追求两份一致。
+**规则**：`Cap_Quest/capture/quest3.py` 与 `Dex_Quest/quest3.py` 已分叉：Cap 侧多了
+无线 ADB 配对/发现（`pair_and_connect`、`parse_mdns_services`）和
+`pc_service_command()`，Dex 侧没有。不要再追求两份一致。
 
 **违反了会怎样**：为了"统一"改动其中一份，另一条线的采集行为被悄悄改变。
 
@@ -168,6 +169,21 @@ Cap，违反约束 1。
 **违反了会怎样**：有人为了"宽容一点"把某一路改回只告警，产物看起来完整、行数正常，
 但那一列全是 NaN，事后只能整份重采。
 
+### 12.1 按键是唯一的录制起点（2026-11-27）
+
+**规则**：`data.h5` 只在「准备完毕 + 按任意键」之后创建；Quest 和手套的待机期样本
+全部丢弃，相机保留按键前的预录（`manifest.cameras.*.pre_roll_s`，下游 Align 按公共
+窗口丢）。就绪判据是**选定位姿**连续 `--quest-ready-samples` 条有效且 0.5 s 内有变化，
+不是 `quest/tracked`（它是头显/手柄/手部的或，手柄休眠时仍为 true），也不是采样计数。
+录制期选定位姿连续 5 s 逐位不变即中止整场。
+
+**为什么**：Quest poller 比手套/相机先起，待机缓冲直接落盘会在 quest 组开头留一段
+按键前的数据；`quest/tracked` 又分不清“手柄休眠”和“手柄静止”。这两件事都只能靠
+“起点由按键定义 + 看选定位姿的 7 个数有没有变”解决。
+
+**违反了会怎样**：quest 组开头多一段 -1/冻结数据，或手柄休眠后整段曲线变成一条水平线；
+查看器和 Align 都把它当真数据。
+
 ### 13. 中止必须走 `abort_recording()`，不许直接 raise
 
 **规则**：运行期故障用 `abort_recording(reason)` —— 它只写 `ABORT_REASON` + 置
@@ -183,15 +199,43 @@ Cap，违反约束 1。
 
 ### 14. 只能用 `python3.10`
 
-**规则**：系统 `python3` 是 3.12 时，`import pxhandsdk` 能过但
-`hasattr(pxhandsdk, "PxCap3")` 为 `False`。
+**规则**：一律显式用 `python3.10`（venv 也用 3.10 建）。`python3` 在装了 conda 的机器上
+可能指向 3.12/3.14，此时 `import pxhandsdk` 能过但 `hasattr(pxhandsdk, "PxCap3")` 为 `False`。
 
 **违反了会怎样**：不是 ImportError，是后续 attribute 访问才炸，报错位置离真因很远。
 
-### 15. 不要用 venv
+### 15. Python 环境：`Paxini-Cap/.venv`（必须 `--system-site-packages`）
 
-**规则**：`python3.10 -m venv` 在这个环境里 ensurepip 会失败。一律
-`python3.10 -m pip install --user`。
+**规则**：在 `Paxini-Cap/` 下用**系统** Python 建 venv（写绝对路径 `/usr/bin/python3.10`，
+否则 conda 或旧 venv 的 `python3.10` 会抢先，见下面「违反了会怎样」），依赖装进 venv：
+
+```bash
+cd Paxini-Cap
+/usr/bin/python3.10 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install --ignore-installed -r requirements.txt
+```
+
+每个新终端先 `source Paxini-Cap/.venv/bin/activate`。`Paxini-Cap/` 下三个代码目录
+（`Cap_Quest/`、`Paxini-Align/`、`py_demo/`）共用这一个环境；`Paxini-Dex/` 的 `.venv`
+是另一套，不要混用。
+
+**为什么**：`pxhandsdk` 随 deb 装到 `/usr/lib/python3/pxhandsdk/dist-packages`，只有
+`--system-site-packages` 的 venv 才看得见（纯 venv、conda 都是 `PxCap3` 缺失）。
+`--ignore-installed` 让 pip 把 numpy/h5py/matplotlib 装进 venv，而不是复用 `~/.local`
+的共享副本——否则别的工程一升级 numpy，回放就会 `_ARRAY_API not found`。
+
+**违反了会怎样**：
+- 用成 conda / 旧 venv 的 `python3.10` 建：venv 的 `home` 会指向那个解释器，`pxhandsdk`
+  仍然看不见；`cat Paxini-Cap/.venv/pyvenv.cfg` 里 `home` 必须是 `/usr/bin`。
+- 漏了 `--system-site-packages`：`import pxhandsdk` 可能过、但 `PxCap3` 缺失，手套起不来。
+  不用重建，软链一次即可：
+  `ln -sfn /usr/lib/python3/pxhandsdk/dist-packages/pxhandsdk .venv/lib/python3.10/site-packages/`
+- 漏了 `--ignore-installed`：numpy 仍来自 `~/.local`，回放随时被其他工程带崩。
+- 混用 `Paxini-Dex/.venv`：Dex 的依赖集与 Cap 不同，装包会互相覆盖。
+
+> 2026-11-26 修订：原规则“不要用 venv / ensurepip 会失败”来自 2026-11-16 的 WSL 时期，
+> 在原生 Ubuntu 22.04 上已不成立（`python3.10-venv` 已装，venv 内 pip 22.0.2 正常）。
 
 ### 16. 相机只有 V4L2 一条路（2026-11-20 起）
 

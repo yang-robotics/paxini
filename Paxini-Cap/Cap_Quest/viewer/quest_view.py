@@ -183,6 +183,7 @@ def load_quest_view(
     alignment: str = QUEST_ALIGNMENT,
     cap_unix_ns: int | None = None,
     clock_report: dict[str, Any] | None = None,
+    poll_rate_hz: float = 120.0,
 ) -> dict[str, Any] | None:
     """Build a compact, JSON-friendly Quest visualization payload.
 
@@ -206,6 +207,10 @@ def load_quest_view(
     sdk_valid_count, sdk_backwards, sdk_missing = _stamp_quality(sdk_raw)
     sdk_valid_fraction = sdk_valid_count / total
     sdk_max_run = _max_same_timestamp_run(sdk_raw)
+    rate = float(poll_rate_hz)
+    if not math.isfinite(rate) or rate <= 0.0:
+        rate = 120.0
+    sdk_max_run_s = sdk_max_run / rate
     sdk_usable = (
         sdk_valid_count >= 2
         and sdk_backwards == 0
@@ -237,7 +242,7 @@ def load_quest_view(
             limits = clock_report.get("thresholds") or {}
             min_valid_fraction = float(limits.get("min_valid_fraction", 0.95))
             max_backwards = int(limits.get("max_backwards_steps", 0))
-            max_run = int(limits.get("max_same_timestamp_run", 10))
+            max_run_s = float(limits.get("max_same_timestamp_run_s", 1.0))
             failures: list[str] = []
             if not sdk_usable:
                 failures.append("SDK 时间戳没有可用的递增时间轴")
@@ -247,9 +252,10 @@ def load_quest_view(
                 )
             if sdk_backwards > max_backwards:
                 failures.append(f"时间戳倒退 {sdk_backwards} 次")
-            if sdk_max_run > max_run:
+            if sdk_max_run_s > max_run_s:
                 failures.append(
-                    f"同一时间戳连续重复 {sdk_max_run} 次，超过 {max_run}"
+                    f"同一时间戳连续重复 {sdk_max_run} 次 / "
+                    f"{sdk_max_run_s:.3f} 秒，超过 {max_run_s:g} 秒"
                 )
             if failures:
                 raise ValueError(
@@ -374,6 +380,8 @@ def load_quest_view(
             "sdk_missing_timestamps": sdk_missing,
             "sdk_backwards_steps": sdk_backwards,
             "sdk_max_same_timestamp_run": sdk_max_run,
+            "sdk_max_same_timestamp_run_s": float(sdk_max_run_s),
+            "poll_rate_hz": rate,
             "sdk_valid_fraction": float(sdk_valid_fraction),
             "sequence_gaps": sequence_gaps,
             "tracked_rows": int(np.count_nonzero(tracked_all)),

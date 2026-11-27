@@ -1,6 +1,6 @@
 # PXCap III 采集配置。存在即加载；命令行参数永远优先于本文件。
 # 逐字段的详细说明与取值范围见 Cap_Quest/README.md「6.2 参数表」。
-# 改完用 `python3.10 capture/collect_cap.py --help` 核对最终默认值。
+# 配置只在启动时生效；`--help` 显示的是内置默认值（不会反映本文件）。
 
 # ---------------------------------------------------------------- 手套
 hand_port: auto          # 串口。auto = 按 USB VID:PID 28e9:018a 自动发现
@@ -15,12 +15,17 @@ camera_width: 1280       # 必须是设备支持的模式，否则 ffmpeg 起不
 camera_height: 720
 camera_fps: 30
 video_codec: copy        # copy 直通（CPU≈0）/ h264 / hevc / mjpeg
+ffmpeg: auto             # auto = 先读 $FFMPEG 再找 PATH；也可写绝对路径（需 5.0+，带 -fps_mode）
 
 # ---------------------------------------------------------------- Quest
 pose_source: controller  # controller / hand / head
 pose_side: auto          # auto=跟随 cap_side；left/right 可显式覆盖
 quest_rate: 120          # 主机轮询频率 Hz，不是头显推送频率
+quest_ready_samples: 10  # 连续多少条有效选定位姿才判就绪；还要求 0.5 s 内位姿有变化
 no_quest: false          # true = 只采手套与相机，quest 组写 NaN
+
+# ---------------------------------------------------------------- 启动
+no_wait: false           # true = 就绪后不等待按键，自动开始；非 TTY/自动化用
 
 # ---------------------------------------------------------------- 体积与视图
 omit_distribution: false # true = 不写 10×119×3 分布力，体积降到几 MB/h

@@ -109,9 +109,13 @@ python tools/upload_modelscope.py --zip --upload            # 需要打包时才
 - 脚本会自己建 staging 目录，不用手工建；`.upload_staging/` 与 `*.zip` 都在
   `.gitignore` 里。
 
-`modelscope` 只有 `--upload` 那条路需要（`--dry-run` 是纯标准库）。没装就
-`python3.10 -m pip install --user modelscope`，装完记得确认 numpy / h5py 没被连带
-改版本。
+`modelscope` 只有 `--upload` 那条路需要（`--dry-run` 是纯标准库）。没装就装进
+`Paxini-Cap/.venv`，别用 `--user` 污染共享环境：
+
+```bash
+source .venv/bin/activate          # 当前在 Paxini-Cap/ 下
+pip install modelscope
+```
 
 ## 新增采集
 

@@ -232,16 +232,17 @@ V4L2 驱动在每次出帧的 `v4l2_buffer.flags` 里声明时钟类型（`TIMES
 | 属性                             | 内容                                                                            |
 | ------------------------------ | ----------------------------------------------------------------------------- |
 | `format_version`               | 结构版本，当前 `4`                                                                   |
-| `started_at` / `ended_at`      | 本地时区 ISO 时间                                                                   |
-| `rows` / `quest_rows`          | `N` / `Q`                                                                     |
+| `started_at` / `ended_at`      | **按键开始**的本地时区 ISO 时间 / manifest 写出时刻                                   |
+| `session`                      | 按键时刻 `started_at` / `started_unix_ns` / `started_monotonic_ns`、`ready_wait_s`、`key_wait_s`、`auto_start`、待机丢弃数 |
+| `rows` / `quest_rows`          | `N` / `Q`（都不含待机期）                                                             |
 | `actual_rate_hz`               | 按首末帧单调钟跨度算的实际频率                                                               |
-| `duration_s` / `sample_span_s` | 墙钟耗时 / 手套首末帧跨度                                                                |
+| `duration_s` / `sample_span_s` | 从按键算起的墙钟耗时 / 手套首末帧跨度                                                        |
 | `alignment`                    | 固定为 `none (raw per-source timestamps only)`                                   |
 | `pose`                         | 主位姿来源、分量顺序、坐标系说明                                                              |
-| `hand`                         | 单只手套手别 `side`、Quest 请求手别 `pose_side_requested`、串口、SN、SDK/固件版本、故障、回调耗时、队列溢出 |
-| `quest`                        | `enabled`、`errors`（被 `XrtReader.call` 吞掉的 getter 异常，按接口名记）、`timestamp_source`、`timestamp_fields`、`rows`、`samples_dropped`、`poller_alive`、轮询次数与 `poller_overruns` |
-| `cameras`                      | `backend`（固定 `linux`）、每路设备节点、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s` |
-| `runtime`                      | `abort_reason`（中止原因，正常结束为 null）、`configured_sources`、检查频率与停滞阈值、`camera_stalls`、`glove_stalls` |
+| `hand`                         | 单只手套手别 `side`、Quest 请求手别 `pose_side_requested`、串口、SN、SDK/固件版本、故障、回调耗时、队列溢出、`standby_frames_discarded` |
+| `quest`                        | `enabled`、`errors`、`timestamp_source`、`timestamp_fields`、`rows`、`valid_rows`（已写入行里的有效行）、`first_sequence` / `last_sequence`、`standby_samples_discarded`、`selected_pose`（判据、待机/运行期变化、`stale_max_s`、`stale_warnings`）、`samples_dropped`、`poller_alive`、轮询次数与 `poller_overruns` |
+| `cameras`                      | `backend`（固定 `linux`）、每路设备节点、帧数、分辨率、实际 fps、时间窗、错误、`first_frame_s`（`camera.start()`→首帧）、`pre_roll_s`（首帧→按键） |
+| `runtime`                      | `abort_reason`（中止原因，正常结束为 null）、`configured_sources`、检查频率与停滞阈值（含 `quest_valid_*`、`quest_pose_*`）、`camera_stalls`、`glove_stalls` |
 | `verify`                       | 行数自检结果（`row_mismatch` 必须为空）                                                   |
 | `env`                          | python / numpy / h5py / ffmpeg 版本                                             |
 
